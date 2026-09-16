@@ -1,0 +1,563 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SOI Viewer</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#161b22; --border:#2a313c; --text:#e6edf3;
+    --muted:#8b949e; --accent:#3d8bfd; --ok:#3fb950; --warn:#d29922; --err:#f85149;
+    --mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, monospace;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--text);
+    font:14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    min-height:100vh;
+  }
+  header {
+    display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+    padding:12px 18px; border-bottom:1px solid var(--border); background:var(--panel);
+  }
+  header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.2px; }
+  header .sub { color:var(--muted); font-size:12px; }
+  #dot { width:9px; height:9px; border-radius:50%; background:var(--muted); flex:none; }
+  #dot.on { background:var(--ok); box-shadow:0 0 8px var(--ok); }
+  #dot.bad { background:var(--err); }
+  #dot.wait { background:var(--warn); }
+
+  main { padding:18px; max-width:1200px; margin:0 auto; }
+  .card {
+    background:var(--panel); border:1px solid var(--border);
+    border-radius:10px; padding:16px; margin-bottom:16px;
+  }
+  .card h2 { font-size:13px; margin:0 0 10px; color:var(--muted);
+             text-transform:uppercase; letter-spacing:.7px; font-weight:600; }
+  label { display:block; font-size:12px; color:var(--muted); margin:10px 0 4px; }
+  textarea, input[type=password] {
+    width:100%; background:#0b0e13; color:var(--text);
+    border:1px solid var(--border); border-radius:6px; padding:10px;
+    font-family:var(--mono); font-size:12px; resize:vertical;
+  }
+  textarea { min-height:90px; word-break:break-all; }
+  textarea:focus, input:focus { outline:none; border-color:var(--accent); }
+  .row { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }
+  button {
+    background:var(--accent); color:#fff; border:0; border-radius:6px;
+    padding:9px 16px; font-size:13px; font-weight:600; cursor:pointer;
+  }
+  button.ghost { background:transparent; border:1px solid var(--border); color:var(--text); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button:not(:disabled):hover { filter:brightness(1.12); }
+
+  #msg { margin-top:12px; font-size:13px; padding:10px 12px; border-radius:6px; display:none; }
+  #msg.show { display:block; }
+  #msg.ok   { background:rgba(63,185,80,.12);  color:var(--ok);   border:1px solid rgba(63,185,80,.3); }
+  #msg.err  { background:rgba(248,81,73,.12);  color:var(--err);  border:1px solid rgba(248,81,73,.3); }
+  #msg.info { background:rgba(61,139,253,.12); color:var(--accent);border:1px solid rgba(61,139,253,.3); }
+
+  #stage { display:none; }
+  #stage.show { display:block; }
+  .videowrap { position:relative; background:#000; border-radius:10px; overflow:hidden;
+               border:1px solid var(--border); }
+  video { width:100%; display:block; background:#000; }
+
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr));
+           gap:1px; background:var(--border); border-radius:8px; overflow:hidden;
+           margin-top:14px; border:1px solid var(--border); }
+  .stat { background:var(--panel); padding:10px 12px; }
+  .stat .k { font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.6px; }
+  .stat .v { font-family:var(--mono); font-size:16px; margin-top:2px; }
+
+  details { margin-top:14px; }
+  summary { cursor:pointer; color:var(--muted); font-size:12px; }
+  .note { color:var(--muted); font-size:12px; margin-top:10px; }
+  code { font-family:var(--mono); background:#0b0e13; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+
+<header>
+  <span id="dot"></span>
+  <h1>SOI Viewer</h1>
+  <span class="sub" id="status">waiting for an offer</span>
+</header>
+
+<main>
+  <section class="card" id="setup">
+    <h2>Connect</h2>
+
+    <label for="offer">Offer blob from the sender</label>
+    <textarea id="offer" spellcheck="false" placeholder="SOI1:..."></textarea>
+
+    <label for="pass">Passphrase <span style="opacity:.6">(only if the sender used --pass)</span></label>
+    <input id="pass" type="password" autocomplete="off" placeholder="leave empty if unencrypted">
+
+    <details>
+      <summary>NAT traversal settings</summary>
+      <label for="stun">STUN servers <span style="opacity:.6">(comma separated; clear for same-LAN sharing with zero external contact)</span></label>
+      <input id="stun" type="text" autocomplete="off"
+             value="stun:stun.cloudflare.com:3478, stun:stun.l.google.com:19302">
+
+      <label for="turn">TURN relay <span style="opacity:.6">(optional; only needed if the direct connection fails)</span></label>
+      <input id="turn" type="text" autocomplete="off" placeholder="turn:host:3478  or  turns:host:5349">
+
+      <div class="row" style="margin-top:8px">
+        <input id="turnUser" type="text" autocomplete="off" placeholder="TURN username" style="flex:1;min-width:140px">
+        <input id="turnPass" type="password" autocomplete="off" placeholder="TURN credential" style="flex:1;min-width:140px">
+      </div>
+      <p class="note">
+        Both peers must be able to reach the same TURN relay, but they do not have
+        to use the same one. A relay forwards DTLS-SRTP ciphertext, so it cannot
+        see your screen &mdash; it does learn both IP addresses and how much data
+        you send.
+      </p>
+    </details>
+
+    <div class="row">
+      <button id="go">Generate answer</button>
+      <button id="paste" class="ghost">Paste from clipboard</button>
+    </div>
+
+    <div id="msg"></div>
+
+    <div id="answerBox" style="display:none">
+      <label for="answer">Answer blob &mdash; paste this back into the sender console</label>
+      <textarea id="answer" readonly spellcheck="false"></textarea>
+      <div class="row"><button id="copy" class="ghost">Copy answer</button></div>
+    </div>
+
+    <details>
+      <summary>How this works without a server</summary>
+      <p class="note">
+        WebRTC needs the two peers to exchange an SDP description before a
+        connection exists. That exchange is the only thing a signalling server
+        normally does, and it is just a few kilobytes of text &mdash; so it is
+        carried here by copy-paste instead. The offer is deflate-compressed and,
+        with a passphrase, encrypted with AES-256-GCM (PBKDF2-SHA256, 200k
+        iterations). Once the answer gets back to the sender, media flows
+        <strong>directly</strong> between the two machines; nothing else sees it.
+      </p>
+      <p class="note">
+        A STUN server may still be used to discover public addresses. There is no
+        TURN relay, so if both peers sit behind symmetric NAT the connection
+        cannot be established at all &mdash; that is a protocol limit, not a bug.
+      </p>
+    </details>
+  </section>
+
+  <section id="stage">
+    <div class="card">
+      <h2>Stream</h2>
+      <div class="videowrap">
+        <video id="video" autoplay playsinline muted></video>
+      </div>
+      <div class="row">
+        <button id="full" class="ghost">Fullscreen</button>
+        <button id="key" class="ghost">Request keyframe</button>
+        <button id="hangup" class="ghost">Disconnect</button>
+      </div>
+      <div class="stats">
+        <div class="stat"><div class="k">Resolution</div><div class="v" id="s-res">&mdash;</div></div>
+        <div class="stat"><div class="k">FPS</div><div class="v" id="s-fps">&mdash;</div></div>
+        <div class="stat"><div class="k">Bitrate</div><div class="v" id="s-rate">&mdash;</div></div>
+        <div class="stat"><div class="k">Packet loss</div><div class="v" id="s-loss">&mdash;</div></div>
+        <div class="stat"><div class="k">Jitter</div><div class="v" id="s-jit">&mdash;</div></div>
+        <div class="stat"><div class="k">RTT</div><div class="v" id="s-rtt">&mdash;</div></div>
+        <div class="stat"><div class="k">Decode</div><div class="v" id="s-dec">&mdash;</div></div>
+        <div class="stat"><div class="k">Path</div><div class="v" id="s-path">&mdash;</div></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+'use strict';
+
+// ---------------------------------------------------------------------------
+// Signalling blob codec. MUST stay byte-compatible with src/net/SignalBlob.cpp.
+//
+//   "SOI1:" + base64url( "SOI1" || flags || [salt16 || iv12] || deflate-raw(sdp)
+//                        || [gcmTag16] )
+//   AAD = everything before the ciphertext.
+// ---------------------------------------------------------------------------
+const PREFIX      = 'SOI1:';
+const MAGIC       = [0x53, 0x4F, 0x49, 0x31];          // "SOI1"
+const FLAG_ENC    = 0x01;
+const SALT_LEN    = 16, IV_LEN = 12, TAG_LEN = 16;
+const PBKDF2_ITER = 200000;
+
+function b64urlEncode(bytes) {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function b64urlDecode(text) {
+  const norm = text.replace(/-/g, '+').replace(/_/g, '/').replace(/\s+/g, '');
+  const pad  = norm.length % 4 ? '='.repeat(4 - (norm.length % 4)) : '';
+  const bin  = atob(norm + pad);
+  const out  = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function streamThrough(transform, bytes) {
+  const stream = new Blob([bytes]).stream().pipeThrough(transform);
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+const deflateRaw = b => streamThrough(new CompressionStream('deflate-raw'), b);
+const inflateRaw = b => streamThrough(new DecompressionStream('deflate-raw'), b);
+
+async function deriveKey(passphrase, salt) {
+  const material = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: PBKDF2_ITER, hash: 'SHA-256' },
+    material, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+
+function concat(...parts) {
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+
+async function encodeBlob(sdp, passphrase) {
+  const body = await deflateRaw(new TextEncoder().encode(sdp));
+
+  if (!passphrase) {
+    return PREFIX + b64urlEncode(concat(new Uint8Array(MAGIC), new Uint8Array([0]), body));
+  }
+
+  const salt = crypto.getRandomValues(new Uint8Array(SALT_LEN));
+  const iv   = crypto.getRandomValues(new Uint8Array(IV_LEN));
+  const head = concat(new Uint8Array(MAGIC), new Uint8Array([FLAG_ENC]), salt, iv);
+
+  const key = await deriveKey(passphrase, salt);
+  // WebCrypto appends the 16-byte tag to the ciphertext, which is exactly the
+  // layout OpenSSL's EVP_CTRL_GCM_GET_TAG path produces on the C++ side.
+  const sealed = new Uint8Array(await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: head, tagLength: TAG_LEN * 8 }, key, body));
+
+  return PREFIX + b64urlEncode(concat(head, sealed));
+}
+
+async function decodeBlob(text, passphrase) {
+  let blob = text.trim();
+  const hash = blob.indexOf('#');
+  if (hash >= 0) blob = blob.slice(hash + 1);
+  if (!blob.startsWith(PREFIX)) throw new Error('That is not a SOI offer blob (it should start with "SOI1:").');
+
+  const raw = b64urlDecode(blob.slice(PREFIX.length));
+  if (raw.length < 5 || MAGIC.some((m, i) => raw[i] !== m))
+    throw new Error('The blob header is corrupt.');
+
+  const encrypted = (raw[4] & FLAG_ENC) !== 0;
+
+  if (!encrypted) {
+    return new TextDecoder().decode(await inflateRaw(raw.subarray(5)));
+  }
+  if (!passphrase) throw new Error('This offer is encrypted. Enter the sender’s passphrase.');
+
+  const headLen = 5 + SALT_LEN + IV_LEN;
+  if (raw.length < headLen + TAG_LEN) throw new Error('The encrypted blob is truncated.');
+
+  const head = raw.subarray(0, headLen);
+  const salt = raw.subarray(5, 5 + SALT_LEN);
+  const iv   = raw.subarray(5 + SALT_LEN, headLen);
+  const key  = await deriveKey(passphrase, salt);
+
+  let plain;
+  try {
+    plain = new Uint8Array(await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv, additionalData: head, tagLength: TAG_LEN * 8 },
+      key, raw.subarray(headLen)));
+  } catch {
+    // GCM cannot distinguish a wrong key from tampering, so do not claim to.
+    throw new Error('Authentication failed: wrong passphrase, or the blob was altered.');
+  }
+  return new TextDecoder().decode(await inflateRaw(plain));
+}
+
+// ---------------------------------------------------------------------------
+// UI plumbing
+// ---------------------------------------------------------------------------
+const $ = id => document.getElementById(id);
+const els = {
+  offer: $('offer'), pass: $('pass'), stun: $('stun'), turn: $('turn'),
+  turnUser: $('turnUser'), turnPass: $('turnPass'), go: $('go'), paste: $('paste'),
+  msg: $('msg'), answerBox: $('answerBox'), answer: $('answer'), copy: $('copy'),
+  stage: $('stage'), video: $('video'), status: $('status'), dot: $('dot'),
+  full: $('full'), key: $('key'), hangup: $('hangup'),
+};
+
+let pc = null, control = null, statsTimer = null;
+
+function say(text, kind = 'info') {
+  els.msg.textContent = text;
+  els.msg.className = 'show ' + kind;
+}
+
+function setStatus(text, cls = '') {
+  els.status.textContent = text;
+  els.dot.className = cls;
+}
+
+// Three ways the offer can arrive, in order of how little the user has to do:
+//
+//   1. window.__SOI_OFFER__  -- injected by the sender's local handover server.
+//      Nothing to paste and nothing to send back: the page connects by itself.
+//   2. the URL fragment      -- for a viewer opened from a local file.
+//      Fragments are never transmitted by the browser.
+//   3. manual paste          -- always available.
+(function autoload() {
+  const injected = typeof window.__SOI_OFFER__ === 'string' ? window.__SOI_OFFER__ : '';
+  const frag = decodeURIComponent(location.hash.replace(/^#/, ''));
+  const offer = injected.startsWith(PREFIX) ? injected
+              : (frag.startsWith(PREFIX) ? frag : '');
+  if (!offer) return;
+
+  els.offer.value = offer;
+
+  if (window.__SOI_POST_ANSWER__) {
+    // Served by the sender: connect immediately, no interaction at all.
+    setStatus('connecting automatically', 'wait');
+    say('Connecting to the shared screen…', 'info');
+    els.go.disabled = true;
+    connect(offer, '').catch(err => {
+      say((err && err.message) || String(err), 'err');
+      setStatus('failed', 'bad');
+      els.go.disabled = false;
+    });
+  } else {
+    say('Offer loaded from the page URL. Press "Generate answer".', 'info');
+    setStatus('offer loaded', 'wait');
+  }
+})();
+
+// Hands the answer straight back to the sender when this page was served by it.
+// Returns true if the sender accepted it, false if we should fall back to the
+// manual copy-paste flow.
+async function postAnswerToSender(answerBlob) {
+  if (!window.__SOI_POST_ANSWER__) return false;
+  try {
+    const res = await fetch('/answer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: answerBlob,
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+els.paste.onclick = async () => {
+  try {
+    els.offer.value = (await navigator.clipboard.readText()).trim();
+    say('Pasted from clipboard.', 'info');
+  } catch {
+    say('The browser blocked clipboard access. Paste into the box manually.', 'err');
+  }
+};
+
+els.copy.onclick = async () => {
+  try {
+    await navigator.clipboard.writeText(els.answer.value);
+    say('Answer copied. Paste it into the sender console and press Enter.', 'ok');
+  } catch {
+    els.answer.select();
+    say('Copy blocked by the browser — the text is selected, press Ctrl+C.', 'err');
+  }
+};
+
+els.go.onclick = async () => {
+  els.go.disabled = true;
+  try {
+    await connect(els.offer.value, els.pass.value);
+  } catch (err) {
+    say(err.message || String(err), 'err');
+    setStatus('failed', 'bad');
+    els.go.disabled = false;
+  }
+};
+
+els.full.onclick  = () => els.video.requestFullscreen?.();
+els.key.onclick   = () => {
+  if (control?.readyState === 'open') {
+    control.send(JSON.stringify({ type: 'keyframe' }));
+    say('Keyframe requested.', 'info');
+  }
+};
+els.hangup.onclick = () => { teardown(); setStatus('disconnected'); };
+
+function teardown() {
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+  if (control) { try { control.close(); } catch {} control = null; }
+  if (pc) { try { pc.close(); } catch {} pc = null; }
+  els.stage.classList.remove('show');
+  els.go.disabled = false;
+}
+
+async function connect(offerBlob, passphrase) {
+  if (!offerBlob.trim()) throw new Error('Paste the offer blob first.');
+  if (typeof DecompressionStream === 'undefined')
+    throw new Error('This browser lacks DecompressionStream. Use Chrome 80+, Edge, Firefox 113+ or Safari 16.4+.');
+
+  setStatus('decoding offer', 'wait');
+  const offerSdp = await decodeBlob(offerBlob, passphrase);
+
+  teardown();
+  // The offer already carries every ICE candidate the sender gathered, and the
+  // sender has no channel to receive ours -- so we gather fully before answering.
+  //
+  // We need our own STUN too. Peer-reflexive discovery can sometimes rescue a
+  // host-only answerer, but relying on it is flaky; gathering a server-reflexive
+  // candidate here is what makes NAT-to-NAT actually work. Clear the field for
+  // same-LAN use if you want zero external contact.
+  const iceServers = [];
+  const stunUrls = els.stun.value.split(',').map(s => s.trim()).filter(Boolean);
+  if (stunUrls.length) iceServers.push({ urls: stunUrls });
+
+  const turn = els.turn.value.trim();
+  if (turn) {
+    iceServers.push({
+      urls: turn,
+      username: els.turnUser.value,
+      credential: els.turnPass.value,
+    });
+  }
+  pc = new RTCPeerConnection({ iceServers });
+
+  pc.ontrack = ev => {
+    els.video.srcObject = ev.streams[0] || new MediaStream([ev.track]);
+    els.stage.classList.add('show');
+  };
+
+  pc.ondatachannel = ev => {
+    control = ev.channel;
+    control.onmessage = e => {
+      try {
+        const m = JSON.parse(e.data);
+        if (m.type === 'hello') say(`Connected to a ${m.w}×${m.h} @ ${m.fps}fps share.`, 'ok');
+      } catch {}
+    };
+  };
+
+  pc.onconnectionstatechange = () => {
+    const s = pc.connectionState;
+    setStatus(s, s === 'connected' ? 'on' : (s === 'failed' ? 'bad' : 'wait'));
+    if (s === 'connected') { els.stage.classList.add('show'); startStats(); }
+    if (s === 'failed') {
+      say('ICE failed. With no TURN relay this happens when both peers are behind ' +
+          'symmetric NAT — try the same LAN, or a different network.', 'err');
+    }
+  };
+
+  await pc.setRemoteDescription({ type: 'offer', sdp: offerSdp });
+  await pc.setLocalDescription(await pc.createAnswer());
+
+  setStatus('gathering candidates', 'wait');
+  await waitForGathering(pc, 10000);
+
+  const answerBlob = await encodeBlob(pc.localDescription.sdp, passphrase);
+
+  // Best case: the sender served this page, so hand the answer straight back.
+  if (await postAnswerToSender(answerBlob)) {
+    say('Connected automatically — no copy-paste needed.', 'ok');
+    setStatus('connecting', 'wait');
+    return;
+  }
+
+  els.answer.value = answerBlob;
+  els.answerBox.style.display = 'block';
+
+  try {
+    await navigator.clipboard.writeText(answerBlob);
+    say('Answer generated and copied to your clipboard. Paste it into the sender console.', 'ok');
+  } catch {
+    say('Answer generated. Copy it and paste it into the sender console.', 'ok');
+  }
+  setStatus('waiting for the sender', 'wait');
+}
+
+function waitForGathering(peer, timeoutMs) {
+  if (peer.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise(resolve => {
+    const done = () => {
+      peer.removeEventListener('icegatheringstatechange', check);
+      clearTimeout(timer);
+      resolve();
+    };
+    const check = () => { if (peer.iceGatheringState === 'complete') done(); };
+    // Without a timeout a single unreachable STUN server would hang the flow.
+    const timer = setTimeout(done, timeoutMs);
+    peer.addEventListener('icegatheringstatechange', check);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Stats
+// ---------------------------------------------------------------------------
+function startStats() {
+  if (statsTimer) clearInterval(statsTimer);
+  let prev = null;
+
+  statsTimer = setInterval(async () => {
+    if (!pc) return;
+    const report = await pc.getStats();
+    let video = null, pair = null;
+
+    report.forEach(s => {
+      if (s.type === 'inbound-rtp' && s.kind === 'video') video = s;
+      if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s;
+    });
+    if (!video) return;
+
+    const set = (id, v) => { $(id).textContent = v; };
+
+    set('s-res', `${video.frameWidth || 0}×${video.frameHeight || 0}`);
+
+    if (prev) {
+      const dt = (video.timestamp - prev.timestamp) / 1000;
+      if (dt > 0) {
+        const bits = (video.bytesReceived - prev.bytesReceived) * 8;
+        set('s-rate', `${Math.round(bits / 1000 / dt)} kb/s`);
+
+        const frames = (video.framesDecoded || 0) - (prev.framesDecoded || 0);
+        set('s-fps', (frames / dt).toFixed(1));
+
+        const lost = (video.packetsLost || 0) - (prev.packetsLost || 0);
+        const recv = (video.packetsReceived || 0) - (prev.packetsReceived || 0);
+        const total = lost + recv;
+        set('s-loss', total > 0 ? `${(lost / total * 100).toFixed(1)}%` : '0.0%');
+
+        const decTime = (video.totalDecodeTime || 0) - (prev.totalDecodeTime || 0);
+        set('s-dec', frames > 0 ? `${(decTime / frames * 1000).toFixed(1)} ms` : '—');
+      }
+    }
+
+    set('s-jit', `${((video.jitter || 0) * 1000).toFixed(1)} ms`);
+    set('s-rtt', pair?.currentRoundTripTime != null
+      ? `${(pair.currentRoundTripTime * 1000).toFixed(0)} ms` : '—');
+    set('s-path', pair ? describePath(report, pair) : '—');
+
+    prev = video;
+  }, 1000);
+}
+
+// Shows whether media is flowing over a LAN address, a NAT-mapped one, or a relay.
+function describePath(report, pair) {
+  const local = report.get(pair.localCandidateId);
+  const remote = report.get(pair.remoteCandidateId);
+  const t = c => ({ host: 'LAN', srflx: 'NAT', prflx: 'NAT', relay: 'TURN' })[c?.candidateType] || '?';
+  return `${t(local)}→${t(remote)}`;
+}
+</script>
+</body>
+</html>

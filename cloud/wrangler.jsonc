@@ -1,0 +1,46 @@
+﻿{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "soi-share",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-01",
+
+  // Static assets serve the viewer page; the Worker handles /api/* only.
+  //
+  // run_worker_first: by default Cloudflare serves a matching static asset
+  // straight from the edge and never invokes the Worker, so the security
+  // headers it sets on the page were silently dropped. Routing through the
+  // Worker is what makes the Content-Security-Policy header actually arrive --
+  // and frame-ancestors only works as a header, never via <meta>.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  },
+
+  // Rendezvous storage: one Durable Object per room. Rooms are short-lived
+  // (10 min idle alarm) and hold only ciphertext -- see src/index.js for why
+  // the Worker cannot read them, and why this is a DO rather than KV (KV's
+  // cached misses stalled the sender's answer poll by ~50s and made reconnect
+  // impossible).
+  "durable_objects": {
+    "bindings": [{ "name": "ROOMS", "class_name": "Room" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Room"] }
+  ],
+
+  // Custom domain on the user's own zone. Wrangler provisions the DNS record and
+  // TLS certificate; nothing else on mdarif.online is touched.
+  "routes": [
+    { "pattern": "share.mdarif.online", "custom_domain": true }
+  ],
+
+  // Keep the *.workers.dev URL alive as a fallback while DNS settles.
+  "workers_dev": true,
+
+  "observability": { "enabled": true }
+}
+
+
+

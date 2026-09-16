@@ -1,0 +1,784 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<!-- The real policy is sent as a header by the Worker (frame-ancestors only
+     works there). This copy keeps the page locked down when it is opened
+     straight off disk, where there are no headers. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src 'self'; media-src blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<title>Join a screen share</title>
+<style>
+  /* Two screens: join, and watch. Nothing else belongs here. */
+  :root{
+    color-scheme:light dark;
+    --bg:#ffffff; --fg:#14181d; --muted:#5b646e; --line:#d6dbe1;
+    --field:#f6f7f9; --accent:#0b57d0; --err:#b3261e;
+    --mono:ui-monospace,SFMono-Regular,"Cascadia Mono",Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{--bg:#0e1116; --fg:#e6edf3; --muted:#9aa4af; --line:#2a313c;
+          --field:#161b22; --accent:#7aa7ff; --err:#ff7b72}
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
+       padding:env(safe-area-inset-top) env(safe-area-inset-right)
+               env(safe-area-inset-bottom) env(safe-area-inset-left)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  [hidden]{display:none !important}
+
+  /* ---- screen 1: join ---------------------------------------------------- */
+  #join{max-width:30rem;margin:0 auto;padding:2rem 1.25rem}
+  h1{font-size:1.25rem;margin:0 0 .25rem}
+  .sub{color:var(--muted);font-size:.875rem;margin:0 0 1.5rem}
+
+  .saved{list-style:none;margin:0 0 1.5rem;padding:0}
+  .saved li{display:flex;align-items:center;gap:.5rem;border-bottom:1px solid var(--line)}
+  .saved .pick{flex:1;display:flex;align-items:baseline;gap:.625rem;
+               background:none;border:0;color:inherit;font:inherit;
+               padding:.75rem .25rem;text-align:left;cursor:pointer}
+  .saved .pick:hover .nm{text-decoration:underline}
+  .saved .nm{font-weight:600}
+  .saved .cd{font-family:var(--mono);color:var(--muted);font-size:.875rem;letter-spacing:.08em}
+  .saved .act{background:none;border:0;color:var(--muted);font:inherit;
+              font-size:.8125rem;padding:.75rem .375rem;cursor:pointer}
+  .saved .act:hover{color:var(--fg)}
+
+  label{display:block;font-size:.875rem;margin:0 0 .375rem}
+  input{width:100%;background:var(--field);color:var(--fg);
+        border:1px solid var(--line);border-radius:.5rem;padding:.75rem;font:inherit}
+  #code{font-family:var(--mono);font-size:1.5rem;letter-spacing:.2em;
+        text-align:center;text-transform:uppercase}
+  #code::placeholder{letter-spacing:.1em;font-size:1rem;text-transform:none}
+  #nameWrap{margin-top:1rem}
+  button.go{width:100%;margin-top:1rem;background:var(--accent);color:#fff;
+            border:0;border-radius:.5rem;padding:.8125rem;font:inherit;
+            font-weight:600;cursor:pointer}
+  button.go:disabled{opacity:.5;cursor:default}
+
+  #joinStatus:empty,#error:empty{display:none}
+  #joinStatus{margin-top:1rem;color:var(--muted);font-size:.9375rem}
+  #error{margin-top:1rem;color:var(--err);font-size:.9375rem}
+  .hint{margin-top:2rem;color:var(--muted);font-size:.8125rem}
+
+  /* ---- screen 2: watch --------------------------------------------------- */
+  /* #screen holds the video and NOTHING else: no border, shadow, radius,
+     background, overlay or text. It is a live screen; anything drawn on top of
+     it is in the way. Controls live in the strip below, outside this element. */
+  #screen{display:block}
+  #screen video{display:block;width:100%;height:auto}
+
+  #screen:fullscreen{width:100%;height:100%;display:flex}
+  #screen:fullscreen video{width:100%;height:100%;object-fit:contain}
+
+  #strip{display:flex;align-items:center;gap:1rem;flex-wrap:wrap;
+         padding:.75rem 1rem;font-size:.8125rem;color:var(--muted)}
+  #strip button{background:none;border:0;color:var(--accent);font:inherit;
+                padding:.25rem 0;cursor:pointer}
+  #strip button:hover{text-decoration:underline}
+  #stats{font-family:var(--mono)}
+  #live{flex:1}
+  #qualityWrap,#screenWrap{display:inline-flex;align-items:center;gap:.375rem}
+  #strip label{display:inline;font-size:inherit}
+  #strip select{background:var(--field);color:var(--fg);border:1px solid var(--line);
+                border-radius:.25rem;padding:.125rem .25rem;font:inherit}
+</style>
+</head>
+<body>
+
+<main id="join">
+  <h1>Join a screen share</h1>
+  <p class="sub">Your friend read you a 6-character code.</p>
+
+  <ul class="saved" id="saved" aria-label="Saved screens"></ul>
+
+  <label for="code">Code</label>
+  <input id="code" inputmode="latin" autocomplete="off" autocapitalize="characters"
+         spellcheck="false" placeholder="ABC-DEF" maxlength="7"
+         aria-describedby="error">
+
+  <div id="nameWrap" hidden>
+    <label for="name">Name this screen, so you can recognise it next time</label>
+    <input id="name" maxlength="40" autocomplete="off" placeholder="Arif&rsquo;s laptop">
+  </div>
+
+  <button class="go" id="connect" type="button">Connect</button>
+  <p id="joinStatus" role="status"></p>
+  <p id="error" role="alert"></p>
+
+  <p class="hint">
+    The code never reaches this website. Your browser hashes it to find the room
+    and decrypts the connection details locally, so the server only stores data
+    it cannot read. Video flows directly between the two devices.
+  </p>
+</main>
+
+<div id="watch" hidden>
+  <div id="screen"><video id="video" autoplay playsinline></video></div>
+  <div id="strip">
+    <span id="live" role="status"></span>
+    <span id="stats"></span>
+    <span id="screenWrap" hidden>
+      <label for="monitor">Screen</label>
+      <select id="monitor"></select>
+    </span>
+    <span id="qualityWrap" hidden>
+      <label for="quality">Quality</label>
+      <select id="quality"></select>
+    </span>
+    <button id="full" type="button">Fullscreen</button>
+    <button id="leave" type="button">Disconnect</button>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// --- signalling blob codec, byte-identical to src/net/SignalBlob.cpp ---------
+const PREFIX='SOI1:', MAGIC=[0x53,0x4F,0x49,0x31], FLAG_ENC=0x01;
+const SALT_LEN=16, IV_LEN=12, TAG_LEN=16, PBKDF2_ITER=200000;
+
+// Unambiguous alphabet: no O/0, I/1, L. Must match the sender's generator.
+const ALPHABET='23456789ABCDEFGHJKMNPQRSTUVWXYZ';
+const normalizeCode=s=>(s||'').toUpperCase().split('').filter(c=>ALPHABET.includes(c)).join('');
+const prettyCode=c=>c.length>3?c.slice(0,3)+'-'+c.slice(3):c;
+
+const b64urlEncode=b=>{let s='';for(const x of b)s+=String.fromCharCode(x);
+  return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')};
+const b64urlDecode=t=>{const n=t.replace(/-/g,'+').replace(/_/g,'/').replace(/\s+/g,'');
+  const p=n.length%4?'='.repeat(4-n.length%4):'';const b=atob(n+p);
+  const o=new Uint8Array(b.length);for(let i=0;i<b.length;i++)o[i]=b.charCodeAt(i);return o};
+
+const pipe=(t,b)=>new Response(new Blob([b]).stream().pipeThrough(t)).arrayBuffer().then(a=>new Uint8Array(a));
+const deflateRaw=b=>pipe(new CompressionStream('deflate-raw'),b);
+const inflateRaw=b=>pipe(new DecompressionStream('deflate-raw'),b);
+
+function concat(...parts){const n=parts.reduce((a,p)=>a+p.length,0);const o=new Uint8Array(n);
+  let k=0;for(const p of parts){o.set(p,k);k+=p.length}return o}
+
+async function deriveKey(pass,salt){
+  const m=await crypto.subtle.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:PBKDF2_ITER,hash:'SHA-256'},
+    m,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+
+// The room id is SHA-256 of the code. The code itself is never transmitted.
+async function roomIdFor(code){
+  const h=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(code));
+  return [...new Uint8Array(h)].map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+
+async function encodeBlob(text,pass){
+  const body=await deflateRaw(new TextEncoder().encode(text));
+  const salt=crypto.getRandomValues(new Uint8Array(SALT_LEN));
+  const iv=crypto.getRandomValues(new Uint8Array(IV_LEN));
+  const head=concat(new Uint8Array(MAGIC),new Uint8Array([FLAG_ENC]),salt,iv);
+  const key=await deriveKey(pass,salt);
+  const sealed=new Uint8Array(await crypto.subtle.encrypt(
+    {name:'AES-GCM',iv,additionalData:head,tagLength:TAG_LEN*8},key,body));
+  return PREFIX+b64urlEncode(concat(head,sealed));
+}
+
+async function decodeBlob(blob,pass){
+  const t=(blob||'').trim();
+  if(!t.startsWith(PREFIX)) throw new Error('The sender sent something this page cannot read.');
+  const raw=b64urlDecode(t.slice(PREFIX.length));
+  if(raw.length<5||MAGIC.some((m,i)=>raw[i]!==m))
+    throw new Error('The sender sent something this page cannot read.');
+  if((raw[4]&FLAG_ENC)===0) return new TextDecoder().decode(await inflateRaw(raw.subarray(5)));
+  const headLen=5+SALT_LEN+IV_LEN;
+  const head=raw.subarray(0,headLen), salt=raw.subarray(5,5+SALT_LEN),
+        iv=raw.subarray(5+SALT_LEN,headLen);
+  const key=await deriveKey(pass,salt);
+  let plain;
+  try{
+    plain=new Uint8Array(await crypto.subtle.decrypt(
+      {name:'AES-GCM',iv,additionalData:head,tagLength:TAG_LEN*8},key,raw.subarray(headLen)));
+  }catch{ throw new Error('That code is not right. Check it and ask your friend to read it again.'); }
+  return new TextDecoder().decode(await inflateRaw(plain));
+}
+
+// --- elements ---------------------------------------------------------------
+const $=id=>document.getElementById(id);
+const el={join:$('join'),watch:$('watch'),saved:$('saved'),code:$('code'),
+          nameWrap:$('nameWrap'),name:$('name'),connect:$('connect'),error:$('error'),
+          joinStatus:$('joinStatus'),screen:$('screen'),video:$('video'),live:$('live'),
+          stats:$('stats'),full:$('full'),leave:$('leave'),
+          qualityWrap:$('qualityWrap'),quality:$('quality'),
+          screenWrap:$('screenWrap'),monitor:$('monitor')};
+
+const ICE={iceServers:[{urls:['stun:stun.cloudflare.com:3478','stun:stun.l.google.com:19302']}]};
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+// Sender-side timings this has to interleave with (src/main.cpp):
+//   - the sender waits 15s for the handshake, then republishes a NEW session.
+// So a viewer attempt waits longer than that: if the sender gave up, the next
+// poll finds a fresh session rather than racing the one that just died.
+const ATTEMPT_TIMEOUT=25000;
+const GATHER_TIMEOUT=8000;
+// How long to avoid re-answering a session we already answered and lost. The
+// sender rotates within ~15s of receiving an answer it cannot use, so this
+// normally expires unused -- it only matters if our answer never arrived at
+// all, in which case retrying the same session is exactly right.
+const SESSION_COOLDOWN=30000;
+
+// --- saved screens ----------------------------------------------------------
+// Codes are per-machine and stable, so remembering them makes a rejoin one tap.
+// The name is for the person reading this list and is never sent anywhere.
+const STORE='soi.screens';
+const loadSaved=()=>{
+  try{ const v=JSON.parse(localStorage.getItem(STORE)||'[]');
+       return Array.isArray(v)?v.filter(e=>e&&typeof e.code==='string'):[] }
+  catch{ return [] }
+};
+const putSaved=list=>{ try{ localStorage.setItem(STORE,JSON.stringify(list.slice(0,12))) }catch{} renderSaved(); };
+const findSaved=code=>loadSaved().find(e=>e.code===code);
+
+function rememberScreen(code,name){
+  const list=loadSaved();
+  const at=list.findIndex(e=>e.code===code);
+  const entry={code,name:(name||(at>=0?list[at].name:'')||'').trim(),at:Date.now()};
+  if(at>=0) list.splice(at,1);
+  list.unshift(entry);
+  putSaved(list);
+}
+const forgetScreen=code=>putSaved(loadSaved().filter(e=>e.code!==code));
+function renameScreen(code){
+  const cur=findSaved(code);
+  const next=prompt('Name for this screen',cur&&cur.name||'');
+  if(next===null) return;
+  putSaved(loadSaved().map(e=>e.code===code?{...e,name:next.trim()}:e));
+}
+
+function renderSaved(){
+  const list=loadSaved();
+  el.saved.textContent='';
+  el.saved.hidden=!list.length;
+  for(const e of list){
+    const li=document.createElement('li');
+
+    const pick=document.createElement('button');
+    pick.type='button'; pick.className='pick';
+    pick.onclick=()=>start(e.code);
+    const nm=document.createElement('span');
+    nm.className='nm'; nm.textContent=e.name||'Unnamed screen';
+    const cd=document.createElement('span');
+    cd.className='cd'; cd.textContent=prettyCode(e.code);
+    pick.append(nm,cd);
+    pick.setAttribute('aria-label',`Connect to ${e.name||'unnamed screen'}, code ${prettyCode(e.code)}`);
+
+    const ren=document.createElement('button');
+    ren.type='button'; ren.className='act'; ren.textContent='Rename';
+    ren.onclick=()=>renameScreen(e.code);
+
+    const del=document.createElement('button');
+    del.type='button'; del.className='act'; del.textContent='Remove';
+    del.onclick=()=>forgetScreen(e.code);
+
+    li.append(pick,ren,del);
+    el.saved.appendChild(li);
+  }
+}
+
+// --- join screen ------------------------------------------------------------
+const showError=m=>{el.error.textContent=m||''};
+
+function refreshNamePrompt(){
+  const code=normalizeCode(el.code.value);
+  // Only ask for a name when the code is new: an already-named screen keeps
+  // the name it has.
+  el.nameWrap.hidden=!(code.length===6&&!findSaved(code));
+}
+
+el.code.addEventListener('input',()=>{
+  const n=normalizeCode(el.code.value).slice(0,6);
+  el.code.value=prettyCode(n);
+  showError('');
+  refreshNamePrompt();
+});
+el.code.addEventListener('keydown',e=>{if(e.key==='Enter')el.connect.click()});
+el.name.addEventListener('keydown',e=>{if(e.key==='Enter')el.connect.click()});
+
+el.connect.onclick=()=>{
+  const code=normalizeCode(el.code.value);
+  if(code.length<6){ showError('Enter all 6 characters of the code.'); el.code.focus(); return; }
+  start(code,el.name.value);
+};
+
+// --- the session ------------------------------------------------------------
+// ONE driver loop owns the whole lifecycle. Everything that used to be a timer
+// calling into another timer -- reconnect backoff, the handshake watchdog -- is
+// a step in this loop instead.
+//
+// That is not tidiness, it is the bug fix. With a module-global peer connection
+// and free-running timers, a watchdog armed by attempt N would fire while
+// attempt N+1 was mid-handshake and close ITS peer connection, and an answer
+// could be posted carrying a different attempt's SDP. Here an attempt owns its
+// peer connection as a local, and a generation check after every await means a
+// superseded attempt cannot touch anything.
+let generation=0;
+let stopped=true;
+let wakeLock=null;
+let lastCode='';        // the code the current session is for, for preferences
+
+function stopSession(){
+  generation++;           // invalidates any in-flight attempt
+  stopped=true;
+  if(statsTimer){ clearInterval(statsTimer); statsTimer=null; }
+  control=null;
+  showQuality(null);
+  releaseWake();
+}
+
+async function requestWake(){
+  // Nobody wants the screen to sleep halfway through watching. Behaviour, not UI.
+  try{ if('wakeLock' in navigator && !wakeLock) wakeLock=await navigator.wakeLock.request('screen'); }
+  catch{}
+}
+function releaseWake(){ try{ wakeLock&&wakeLock.release() }catch{} wakeLock=null; }
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='visible'&&!stopped) requestWake();
+});
+
+function showJoin(message){
+  el.join.hidden=false; el.watch.hidden=true;
+  el.video.srcObject=null;
+  el.live.textContent='';
+  el.joinStatus.textContent='';   // the outcome replaces the progress note
+  el.stats.textContent='';
+  showError(message||'');
+  renderSaved();
+  refreshNamePrompt();
+}
+function showWatch(){ el.join.hidden=true; el.watch.hidden=false; }
+
+function start(code,name){
+  stopSession();
+  stopped=false;
+  lastCode=code;
+  showError('');
+  el.code.value=prettyCode(code);
+  el.nameWrap.hidden=true;
+  // A code is only worth remembering once it has actually produced a picture.
+  // Saving on the attempt would fill the list with typos, and -- because the
+  // list is also how this page knows a code is genuine -- would make it wait
+  // forever on one.
+  const known=Boolean(findSaved(code));
+  const gen=++generation;
+  setLive('connecting');
+  driver(code,(name||'').trim(),known,gen).catch(err=>{
+    if(gen!==generation) return;          // superseded; its failure is moot
+    stopped=true;
+    showJoin(err&&err.message||String(err));
+  });
+}
+
+async function driver(code,pendingName,known,gen){
+  const id=await roomIdFor(code);
+  // Sessions we answered and then lost. Re-answering one is the single most
+  // expensive mistake this page can make: it burns a full ICE timeout talking
+  // to a sender that has already given up on it. Measured against the real
+  // sender, this was why reconnection never converged -- the page kept
+  // answering a dead offer instead of waiting for the live one behind it.
+  const spent=new Map();
+  let everConnected=false;
+  let waitingSince=Date.now();
+
+  while(gen===generation){
+    let room=null;
+    try{ room=await getOffer(id); }
+    catch{
+      setLive('waiting for the network');
+      await sleep(2000);
+      continue;
+    }
+    if(gen!==generation) return;
+
+    if(!room){
+      // No room under this code. For a code typed in for the first time that
+      // almost always means a typo or an expired code, and saying so quickly is
+      // the helpful thing to do.
+      //
+      // For a code that has worked on this device before it means the opposite:
+      // the sender is between sessions -- restarting, or busy with the session
+      // we just left -- and the entire point of this page is to wait that out
+      // without anybody touching anything. So it waits, indefinitely, and says
+      // what it is doing.
+      if(!everConnected&&!known&&Date.now()-waitingSince>15000){
+        stopped=true;
+        showJoin('Nobody is sharing with that code. Check the code, or ask your '+
+                 'friend to run "soi-share start" and read it out again.');
+        return;
+      }
+      setLive(everConnected||known?'waiting for the sender':'looking for the sender');
+      await sleep(1500);
+      continue;
+    }
+
+    const lost=spent.get(room.session);
+    if(lost&&Date.now()-lost<SESSION_COOLDOWN){
+      // The sender is still advertising the attempt we just lost. It gives up
+      // 15s after reading an answer it cannot use and republishes a new one;
+      // wait for that rather than talk to a peer that is no longer listening.
+      setLive('reconnecting');
+      await sleep(1000);
+      continue;
+    }
+
+    const outcome=await attempt(id,code,room,gen,()=>{
+      // Fires the moment real frames arrive, not when the session later ends.
+      everConnected=true; known=true;
+      rememberScreen(code,pendingName);
+      pendingName='';
+    });
+    if(gen!==generation) return;
+
+    if(outcome==='badcode'){ stopped=true; showJoin(lastError); return; }
+
+    // 'stale' means the sender replaced the offer before it read our answer, so
+    // the session was never consumed and the next one is already waiting.
+    if(outcome!=='stale') spent.set(room.session,Date.now());
+
+    waitingSince=Date.now();
+    if(outcome!=='stale') await sleep(500);
+  }
+}
+
+let lastError='';
+
+async function getOffer(id){
+  const res=await fetch(`/api/room/${id}`,{cache:'no-store'});
+  if(res.status===404) return null;
+  if(!res.ok) throw new Error('server');
+  return res.json();
+}
+
+// One handshake. Owns its peer connection start to finish; returns why it ended.
+async function attempt(id,code,room,gen,onLive){
+  let sdp;
+  try{ sdp=await decodeBlob(room.offer,code); }
+  catch(err){ lastError=err.message; return 'badcode'; }
+  if(gen!==generation) return 'aborted';
+
+  const pc=new RTCPeerConnection(ICE);
+  const done=deferred();
+  let streaming=false;
+
+  // The sender opens a control channel and announces the quality levels it can
+  // produce. Choosing one is the viewer's call -- only the person watching knows
+  // whether they need to read small text or just glance at it.
+  pc.ondatachannel=ev=>{
+    if(ev.channel.label!=='soi-control') return;
+    const ch=ev.channel;
+    control=ch;
+    ch.onmessage=m=>{ try{ onControl(JSON.parse(m.data),code) }catch{} };
+    ch.onclose=()=>{ if(control===ch){ control=null; showQuality(null) } };
+  };
+
+  pc.ontrack=ev=>{
+    el.video.srcObject=ev.streams[0]||new MediaStream([ev.track]);
+    streaming=true;
+    showWatch();
+    setLive('connected');
+    requestWake();
+  };
+  pc.onconnectionstatechange=()=>{
+    const s=pc.connectionState;
+    if(s==='connected'){ setLive('connected'); }
+    if(s==='failed'||s==='closed') done.resolve('failed');
+    if(s==='disconnected') done.resolve(streaming?'dropped':'failed');
+  };
+
+  try{
+    await pc.setRemoteDescription({type:'offer',sdp});
+    await pc.setLocalDescription(await pc.createAnswer());
+    if(gen!==generation){ pc.close(); return 'aborted'; }
+
+    setLive(streaming?'reconnecting':'connecting');
+    await gather(pc,GATHER_TIMEOUT);
+    if(gen!==generation){ pc.close(); return 'aborted'; }
+
+    // Munged on the way out only. setLocalDescription has already run with
+    // Chrome's own SDP, and profile-level-id in an answer describes what WE can
+    // receive -- so telling the sender the truth about our decoder does not
+    // change anything locally.
+    const answer=await encodeBlob(raiseH264Level(pc.localDescription.sdp),code);
+    const post=await fetch(`/api/room/${id}/answer`,{
+      method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({answer,session:room.session}),
+    });
+    if(gen!==generation){ pc.close(); return 'aborted'; }
+
+    // The sender replaced this offer while we were answering it. Our answer was
+    // never seen, so this session is not spent -- go straight back for the new
+    // offer instead of sitting out a cooldown.
+    if(post.status===409){ pc.close(); return 'stale'; }
+    if(post.status===404){ pc.close(); return 'failed'; }
+    if(!post.ok){ pc.close(); return 'failed'; }
+
+    setLive(streaming?'reconnecting':'connecting');
+
+    const timer=setTimeout(()=>done.resolve('timeout'),ATTEMPT_TIMEOUT);
+    // Resolve as soon as media actually arrives, not merely when ICE says it
+    // connected: decoded frames are the only proof the path really works.
+    // Gated on this attempt's own ontrack, because until that fires the element
+    // still holds the PREVIOUS session's stream and would report a stale size.
+    const watch=setInterval(()=>{
+      if(streaming&&el.video.videoWidth>0) done.resolve('connected');
+    },250);
+
+    // Watch for the sender replacing the offer under us. It does that whenever
+    // it decides this attempt is not going to work -- including when our own
+    // answer was what told it we wanted back in. Noticing here rather than
+    // waiting out the timeout is the difference between rejoining in a few
+    // seconds and rejoining in half a minute.
+    const supersede=setInterval(async()=>{
+      try{
+        const now=await getOffer(id);
+        if(!now||now.session!==room.session) done.resolve('stale');
+      }catch{}
+    },2000);
+
+    const why=await done.promise;
+    clearTimeout(timer); clearInterval(watch); clearInterval(supersede);
+    if(gen!==generation){ pc.close(); return 'aborted'; }
+
+    if(why==='connected'){
+      onLive&&onLive();
+      startStats(pc,gen);
+      // Stay here until the link actually ends.
+      const ended=deferred();
+      pc.onconnectionstatechange=()=>{
+        const s=pc.connectionState;
+        if(s==='failed'||s==='disconnected'||s==='closed') ended.resolve();
+      };
+      if(['failed','disconnected','closed'].includes(pc.connectionState)) ended.resolve();
+      await ended.promise;
+      pc.close();
+      if(gen!==generation) return 'aborted';
+      setLive('reconnecting');
+      return 'connected';
+    }
+
+    pc.close();
+    return 'failed';
+  }catch(err){
+    try{ pc.close() }catch{}
+    return 'failed';
+  }
+}
+
+function deferred(){
+  let resolve; const promise=new Promise(r=>{resolve=r});
+  let settled=false;
+  return {promise,resolve:v=>{if(!settled){settled=true;resolve(v)}}};
+}
+
+// Raise the H.264 level this browser claims it can decode.
+//
+// This is the difference between "the quality setting does nothing" and it
+// actually working. Chrome answers with profile-level-id=4d001f whatever the
+// sender offered -- level 3.1, whose ceiling is 3600 macroblocks, which is
+// EXACTLY 1280x720. So every resolution above 720p was being sent outside the
+// negotiated envelope. Chrome's software decoder mostly copes, but it showed:
+// four freezes totalling 2.1s in a five-second sample at 1920x1200. A stricter
+// hardware decoder -- a phone -- can refuse the stream outright.
+//
+// Chrome does decode well beyond 3.1; the conservative default is about what it
+// would ENCODE. Level 5.1 covers 4K30 and is within what mainstream desktop and
+// mobile decoders handle. The sender also reads this back and will not exceed
+// whatever is claimed here, so the two stay honest with each other.
+const H264_LEVEL='33';   // 0x33 = 5.1
+
+function raiseH264Level(sdp){
+  return sdp.replace(/profile-level-id=([0-9a-fA-F]{6})/g,(m,id)=>{
+    const profile=id.slice(0,2), iop=id.slice(2,4);
+    const current=parseInt(id.slice(4,6),16);
+    // Never lower a level the browser already claims.
+    if(current>=parseInt(H264_LEVEL,16)) return m;
+    return `profile-level-id=${profile}${iop}${H264_LEVEL}`;
+  });
+}
+
+// No trickle ICE: there is no channel to send late candidates on, so the answer
+// has to carry them all.
+function gather(pc,timeoutMs){
+  if(pc.iceGatheringState==='complete') return Promise.resolve();
+  return new Promise(resolve=>{
+    const finish=()=>{pc.removeEventListener('icegatheringstatechange',chk);clearTimeout(t);resolve()};
+    const chk=()=>{if(pc.iceGatheringState==='complete')finish()};
+    const t=setTimeout(finish,timeoutMs);   // never hang on an unreachable STUN
+    pc.addEventListener('icegatheringstatechange',chk);
+  });
+}
+
+// --- quality, chosen by the person watching ---------------------------------
+// The sender holds resolution steady and drops frame rate when the link is
+// slow, so picking a higher level costs smoothness rather than sharpness. The
+// choice is remembered per screen and re-applied on reconnect, because having
+// to reselect it after every network blip would defeat the point.
+let control=null;
+const QUALITY_KEY='soi.quality';
+
+const loadQualityPrefs=()=>{
+  try{ return JSON.parse(localStorage.getItem(QUALITY_KEY)||'{}')||{} }catch{ return {} }
+};
+function rememberQuality(code,level){
+  try{
+    const all=loadQualityPrefs(); all[code]=level;
+    localStorage.setItem(QUALITY_KEY,JSON.stringify(all));
+  }catch{}
+}
+
+function sendControl(msg){
+  if(control&&control.readyState==='open'){
+    try{ control.send(JSON.stringify(msg)); return true }catch{}
+  }
+  return false;
+}
+
+function showQuality(state){
+  if(!state||!state.levels||!state.levels.length){
+    el.qualityWrap.hidden=true; el.screenWrap.hidden=true; return;
+  }
+  el.qualityWrap.hidden=false;
+  const same=el.quality.options.length===state.levels.length&&
+    [...el.quality.options].every((o,i)=>o.value===state.levels[i]);
+  if(!same){
+    el.quality.textContent='';
+    for(const name of state.levels){
+      const o=document.createElement('option');
+      o.value=name; o.textContent=name;
+      el.quality.appendChild(o);
+    }
+  }
+  if(state.level) el.quality.value=state.level;
+
+  // Which screens the sharing PC has. Only worth offering when there is a
+  // choice to make -- a single-monitor machine gets no control at all rather
+  // than a menu with one entry in it.
+  const screens=Array.isArray(state.monitors)?state.monitors:[];
+  el.screenWrap.hidden=screens.length<2;
+  if(screens.length>=2){
+    const want=screens.map(m=>String(m.i)).join(',');
+    if(el.monitor.dataset.ids!==want){
+      el.monitor.dataset.ids=want;
+      el.monitor.textContent='';
+      for(const m of screens){
+        const o=document.createElement('option');
+        o.value=String(m.i);
+        o.textContent=`${m.i+1}: ${m.w}×${m.h}${m.primary?' (main)':''}`;
+        el.monitor.appendChild(o);
+      }
+    }
+    if(state.monitor>=0) el.monitor.value=String(state.monitor);
+  }
+}
+
+function onControl(msg,code){
+  if(!msg||msg.type!=='quality') return;
+  showQuality(msg);
+  // Re-apply a remembered preference once, after a reconnect.
+  const want=loadQualityPrefs()[code];
+  if(want&&msg.levels&&msg.levels.includes(want)&&msg.level!==want){
+    sendControl({type:'setQuality',level:want});
+    return;
+  }
+  if(msg.w&&msg.h) el.quality.title=`sending ${msg.w}x${msg.h} at up to ${msg.fps} fps`;
+}
+
+el.quality.onchange=()=>{
+  const level=el.quality.value;
+  if(!sendControl({type:'setQuality',level})) return;
+  rememberQuality(lastCode,level);
+  setLive('changing quality');
+};
+
+el.monitor.onchange=()=>{
+  // Deliberately NOT remembered: which screen is interesting changes from one
+  // session to the next, and silently reopening on screen 3 because that is
+  // where the last conversation happened would be surprising.
+  if(sendControl({type:'setMonitor',index:Number(el.monitor.value)}))
+    setLive('switching screen');
+};
+
+// --- the strip (everything that is not video) -------------------------------
+// Progress belongs wherever the person is looking: the strip once the video is
+// up, and the join screen before that. Never over the picture.
+function setLive(text){
+  el.live.textContent=text;
+  el.joinStatus.textContent=el.join.hidden?'':(text?text.charAt(0).toUpperCase()+text.slice(1)+'…':'');
+}
+
+let statsTimer=null;
+function startStats(pc,gen){
+  // One session's worth at a time. Reconnecting does not change the generation,
+  // so without this each reconnect would leave another interval behind polling
+  // getStats() on a peer connection that is already closed.
+  if(statsTimer) clearInterval(statsTimer);
+  let prev=null;
+  // Safe to reference `tick` inside its own callback: the first firing is a
+  // second away, long after the assignment completes.
+  const tick=setInterval(async()=>{
+    if(gen!==generation||pc.connectionState==='closed'){
+      clearInterval(tick);
+      if(statsTimer===tick){ statsTimer=null; el.stats.textContent=''; }
+      return;
+    }
+    let v=null,pair=null;
+    const rep=await pc.getStats().catch(()=>null);
+    if(!rep){ return }
+    rep.forEach(s=>{ if(s.type==='inbound-rtp'&&s.kind==='video')v=s;
+      if(s.type==='candidate-pair'&&s.nominated&&s.state==='succeeded')pair=s });
+    if(!v) return;
+    const bits=[`${v.frameWidth||0}×${v.frameHeight||0}`];
+    if(prev){
+      const dt=(v.timestamp-prev.timestamp)/1000;
+      if(dt>0){
+        bits.push(`${(((v.framesDecoded||0)-(prev.framesDecoded||0))/dt).toFixed(0)} fps`);
+        bits.push(`${Math.round((v.bytesReceived-prev.bytesReceived)*8/1000/dt)} kb/s`);
+      }
+    }
+    if(pair&&pair.currentRoundTripTime!=null)
+      bits.push(`${(pair.currentRoundTripTime*1000).toFixed(0)} ms`);
+    el.stats.textContent=bits.join(' · ');
+    prev=v;
+  },1000);
+  statsTimer=tick;
+}
+
+el.full.onclick=()=>{
+  if(document.fullscreenElement){ document.exitFullscreen(); return; }
+  // Fullscreen the container, which holds the video and nothing else, so there
+  // is nothing that could be composited over the picture.
+  if(el.screen.requestFullscreen) el.screen.requestFullscreen({navigationUI:'hide'}).catch(()=>{});
+  // iOS Safari has no element fullscreen; the video's own native path is the
+  // documented fallback and is also chrome-free.
+  else if(el.video.webkitEnterFullscreen) el.video.webkitEnterFullscreen();
+};
+
+el.leave.onclick=()=>{
+  stopSession();
+  el.stats.textContent='';
+  setLive('');
+  showJoin('');
+  el.code.focus();
+};
+
+// --- entry ------------------------------------------------------------------
+renderSaved();
+if(typeof DecompressionStream==='undefined'){
+  showError('This browser is too old for this page. Use Chrome, Edge, Firefox, or Safari 16.4 or newer.');
+  el.connect.disabled=true;
+}
+
+// A code may also arrive as https://host/ABC-DEF, so the sender can send a link.
+(function fromPath(){
+  const c=normalizeCode(decodeURIComponent(location.pathname.replace(/^\//,'')));
+  if(c.length===6){ el.code.value=prettyCode(c); refreshNamePrompt();
+    if(findSaved(c)) start(c); }
+})();
+</script>
+</body>
+</html>
