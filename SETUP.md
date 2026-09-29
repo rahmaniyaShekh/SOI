@@ -3,6 +3,10 @@
 Start to finish: install the toolchain, build the sender, deploy your own rendezvous,
 share your screen. Every step is spelled out, including the ones that are easy to skip.
 
+> **Only want to run it?** You don't need any of this. Download `soi-share.exe` from the
+> GitHub Releases page and run it — see [INSTALL.md](INSTALL.md). This guide is for
+> building from source and hosting your own rendezvous.
+
 You need to do **Part A** (build) and **Part B** (rendezvous) once per machine. After
 that, sharing is a single command.
 

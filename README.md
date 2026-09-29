@@ -19,6 +19,9 @@ soi-share status                   # from any terminal
 soi-share stop                     # from any terminal
 ```
 
+**Just want to use it?** Download `soi-share.exe` from the Releases page and run it —
+no setup. See [INSTALL.md](INSTALL.md). To build from source, see [SETUP.md](SETUP.md).
+
 ---
 
 # Part 1 — Requirements analysis
@@ -741,7 +744,7 @@ Output: `build\Release\soi-share.exe` plus `viewer.html`.
 Windows. `viewer.html` is also compiled into the exe, so **`soi-share.exe` on its own is
 the whole install** — no installer, no redistributable, no admin rights, no GPU required
 (software encoder fallback). A `viewer.html` placed next to the exe overrides the
-embedded copy. Prebuilt binaries are on the GitHub Releases page.
+embedded copy. Prebuilt binaries are on the GitHub Releases page — see [INSTALL.md](INSTALL.md).
 
 Double-clicking the exe does the same as `soi-share start`: it starts sharing in the
 background, shows the code, and waits for a key press before closing its window.

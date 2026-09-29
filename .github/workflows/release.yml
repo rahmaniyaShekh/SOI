@@ -69,6 +69,13 @@ jobs:
             Your friend opens https://share.mdarif.online and types the code. It works
             from any network. The zip also contains `viewer.html` for the offline
             `--no-code` flow.
+
+            First run: the exe is unsigned, so SmartScreen may say "Windows protected
+            your PC" — click **More info → Run anyway**. Allow the firewall prompt on
+            Private networks.
+
+            Install to PATH, updating, uninstalling and troubleshooting:
+            [INSTALL.md](https://github.com/${{ github.repository }}/blob/main/INSTALL.md)
           files: |
             dist/soi-share.exe
             soi-share-${{ github.ref_name }}-windows-x64.zip
