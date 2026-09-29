@@ -491,12 +491,23 @@ void Streamer::handleControlMessage(const std::string& text) {
         return;
     }
 
-    // The viewer choosing a different monitor. The index is validated against
-    // the live monitor list by the handler, not trusted from here.
-    if (containsKey(text, "setMonitor")) {
-        long long index = 0;
-        if (extractInt(text, "index", index) && index >= 0 && index < 64 && onMonitor_)
-            onMonitor_(static_cast<int>(index));
+    // The viewer choosing what to watch: a monitor by index, or every screen at
+    // once. "setMonitor" is the older monitor-only spelling and still works, so
+    // a viewer.html that predates this does not break.
+    //
+    // Nothing is decided here. The bound below only keeps a nonsense index out
+    // of the enumeration code; the real checks -- does this monitor exist, and
+    // is this viewer allowed to change the target at all -- are made on the
+    // capture thread against the live state of the machine.
+    if (containsKey(text, "setTarget") || containsKey(text, "setMonitor")) {
+        std::string kind;
+        if (!extractString(text, "kind", kind)) kind = "monitor";
+
+        long long index = -1;
+        if (!extractInt(text, "index", index)) index = -1;
+        if (index < -1 || index >= 64) return;
+
+        if (onTarget_) onTarget_(kind, static_cast<int>(index));
         return;
     }
 

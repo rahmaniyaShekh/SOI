@@ -17,8 +17,10 @@
 #include "capture/CaptureFactory.h"
 #include "capture/CaptureProtect.h"
 #include "encode/ColorConvert.h"
+#include "capture/DxgiCapture.h"
 #include "encode/H264Encoder.h"
 #include "encode/Quality.h"
+#include "gpu/GpuPipeline.h"
 #include "net/SignalBlob.h"
 #include "net/Streamer.h"
 #include "util/Log.h"
@@ -28,6 +30,9 @@
 #include <windows.h>
 #include <mfapi.h>
 #include <shellapi.h>
+// gpu-check builds a converter to prove the shader path really works, and its
+// ComPtr members need the complete D3D11 interfaces to destruct.
+#include <d3d11.h>
 
 #include <algorithm>
 #include <atomic>
@@ -75,6 +80,11 @@ struct Options {
     // normal way to run -- see capture/CaptureFactory.h.
     CaptureBackend backend = CaptureBackend::Auto;
 
+    // Where the colour conversion happens, and whether the frame ever comes back
+    // to the CPU at all. See gpu/GpuPipeline.h -- this is a capability choice,
+    // not only a speed one, which is why it is picked at start and held.
+    Pipeline pipeline = Pipeline::Auto;
+
     // Quality is chosen by NAME and can be changed by the viewer mid-session.
     // The level decides the encode height, the nominal frame rate and the
     // per-frame bit budget -- see encode/Quality.h for why frame rate is what
@@ -92,6 +102,14 @@ struct Options {
     bool cursor     = false;
     bool layered    = false;
     bool protect    = true;
+
+    // Whether the viewer may change WHAT is shared, as opposed to how it looks.
+    //
+    // Sharing one window is already an explicit narrowing -- the operator picked
+    // that window and nothing else -- so a window share is ALWAYS locked and
+    // this flag is not consulted. It exists to apply the same rule to a screen
+    // share: --monitor 1 --lock-target shares monitor 1 and only ever monitor 1.
+    bool lockTarget = false;
     // Never open a browser on the sharing machine: this is a headless tool, and
     // a browser window here would be one more thing on the screen being shared.
     bool openViewer = false;
@@ -143,12 +161,24 @@ USAGE
   soi-share list-monitors      enumerate monitors
   soi-share list-windows       enumerate capturable windows
   soi-share capture-check      try every capture backend and report what works
+  soi-share gpu-check          report whether frames can stay on the GPU, and why not
   soi-share purge              erase all on-disk state (log, share code, blobs)
 
 CAPTURE TARGET
   --monitor <N>          share monitor N (default: 0)
-  --desktop              share the whole virtual desktop
+  --desktop              share every screen at once, as one wide picture
   --window <hwnd|text>   share one window, by handle or title substring
+
+                         This only sets where the session STARTS. On a screen
+                         share the viewer is shown how many screens this PC has
+                         and can switch between them -- or to all of them at
+                         once -- from their browser, without touching this PC.
+                         `soi-share list-monitors` shows what they will see.
+
+                         A WINDOW share is never switchable: the operator chose
+                         one window, and no message from the far end can widen
+                         that to a screen. Use --lock-target to pin a screen
+                         share the same way.
 
   --capture <backend>    auto | dxgi | wgc | bitblt   (default: auto)
                          Auto is what makes the share show everything on the
@@ -162,6 +192,21 @@ CAPTURE TARGET
                          Naming one pins it and disables that fallback, which is
                          for diagnosing a problem, not for sharing. Run
                          `soi-share capture-check` first.
+
+PIPELINE
+  --gpu                  keep every frame on the graphics card: Desktop
+                         Duplication's texture is colour-converted to NV12 by a
+                         shader and handed straight to the hardware encoder. No
+                         readback, no CPU conversion, no upload. Fails to start
+                         if this machine cannot do it, rather than falling back.
+
+  --cpu                  always read frames back and convert with SSE2. Slower,
+                         and the only path that can composite --cursor.
+
+  --pipeline <mode>      auto | gpu | cpu   (default: auto)
+                         Auto is --gpu where every precondition holds and --cpu
+                         otherwise. `soi-share gpu-check` says which you get and
+                         why.
 
 QUALITY
   --quality <level>      360p | 480p | 720p | 1080p | source   (default 720p)
@@ -187,6 +232,9 @@ QUALITY
 
 PRIVACY
   --protect / --no-protect   exclude our own windows from capture (default on)
+  --lock-target              pin the share to the target named above. The viewer
+                             gets no screen picker and is not told what other
+                             screens exist. Implied by --window.
   --pass <passphrase>        encrypt signalling blobs (AES-256-GCM)
 
 NETWORK
@@ -243,6 +291,17 @@ bool parseOptions(int argc, char** argv, int first, Options& o) {
         else if (a == "--layered")           { o.layered = true; }
         else if (a == "--protect")           { o.protect = true; }
         else if (a == "--no-protect")        { o.protect = false; }
+        else if (a == "--lock-target")       { o.lockTarget = true; }
+        else if (a == "--gpu")               { o.pipeline = Pipeline::Gpu; }
+        else if (a == "--cpu")               { o.pipeline = Pipeline::Cpu; }
+        else if (a == "--pipeline") {
+            const char* v = next("--pipeline");
+            if (!v) return false;
+            if (!parsePipelineName(v, o.pipeline)) {
+                logE("unknown pipeline '{}'; choose one of: auto, gpu, cpu", v);
+                return false;
+            }
+        }
         else if (a == "--no-viewer")         { o.openViewer = false; }
         else if (a == "--open-viewer")       { o.openViewer = true; }
         else if (a == "--no-http")           { o.http = false; }
@@ -350,6 +409,15 @@ std::vector<std::string> rebuildArgs(int argc, char** argv, int first) {
 // Helpers
 // ---------------------------------------------------------------------------
 
+// The bounding box of every monitor together -- what --desktop captures, and
+// what the viewer gets when they pick "all screens". On a single-monitor machine
+// it is that monitor; with several it is wider than any one of them, and it
+// includes the dead space between mismatched screens.
+void virtualDesktopSize(int& width, int& height) {
+    width  = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+}
+
 void listMonitors() {
     const auto mons = enumerateMonitors();
     std::printf("\n%-6s %-16s %-14s %-10s %s\n", "INDEX", "DEVICE", "SIZE", "ORIGIN", "PRIMARY");
@@ -357,7 +425,34 @@ void listMonitors() {
         std::printf("%-6d %-16s %-14s %-10s %s\n", m.index, m.name.c_str(),
                     soi::format("{}x{}", m.width, m.height).c_str(),
                     soi::format("{},{}", m.x, m.y).c_str(), m.primary ? "yes" : "");
-    std::printf("\n%zu monitor(s)\n", mons.size());
+
+    int deskW = 0, deskH = 0;
+    virtualDesktopSize(deskW, deskH);
+    std::printf("\n%zu monitor(s); all screens together are %dx%d\n",
+                mons.size(), deskW, deskH);
+    std::printf("The viewer chooses between these from their browser. To stop "
+                "that, add --lock-target.\n");
+}
+
+// The hand-rolled control JSON has no escaping of its own, and a device name
+// like \\.\DISPLAY1 is mostly backslashes -- emitting it raw produces a message
+// the viewer cannot parse, which silently costs it the whole screen list.
+std::string jsonEscape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size() + 8);
+    for (const unsigned char c : in) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) out += soi::format("\\u{:04x}", static_cast<int>(c));
+                else          out += static_cast<char>(c);
+        }
+    }
+    return out;
 }
 
 void listWindows() {
@@ -439,6 +534,90 @@ void captureCheck(const Options& opt) {
             "SetWindowDisplayAffinity, or is only visible on the secure desktop. No\n"
             "user-mode capture API on Windows can read either -- see README 1.2.\n\n");
     }
+}
+
+// "Why am I not getting the GPU pipeline?" answered without a debugger.
+//
+// Each precondition is checked by actually doing it, not by inferring it from a
+// driver version: the capture is started, the device is shared, the encoder is
+// asked whether it will take that device. Anything that fails here is exactly
+// what would have failed at `start`.
+void gpuCheck(const Options& opt) {
+    CaptureConfig cfg;
+    cfg.target        = opt.target;
+    cfg.monitorIndex  = opt.monitorIndex;
+    cfg.captureCursor = opt.cursor;
+    cfg.maxWidth      = opt.maxWidth;
+    cfg.backend       = CaptureBackend::Dxgi;
+    cfg.preferGpu     = true;
+
+    std::printf("\nchecking whether frames can stay on the graphics card...\n\n");
+
+    if (opt.target == CaptureTarget::Window) {
+        std::printf("  target      NO -- a window share is Windows.Graphics.Capture, and\n"
+                    "                    only Desktop Duplication has a GPU path today.\n\n"
+                    "Result: the CPU pipeline. Share a screen for the GPU one.\n\n");
+        return;
+    }
+    std::printf("  target      yes -- a screen, which Desktop Duplication can read\n");
+
+    if (opt.cursor) {
+        std::printf("  --cursor    NO -- the cursor is drawn with GDI onto CPU pixels,\n"
+                    "                    which the GPU path does not have.\n\n"
+                    "Result: the CPU pipeline. Drop --cursor for the GPU one.\n\n");
+        return;
+    }
+
+    DxgiCapture capture(cfg);
+    if (!capture.start()) {
+        std::printf("  capture     NO -- Desktop Duplication would not start at all.\n"
+                    "                    Run `soi-share capture-check` for why.\n\n"
+                    "Result: the CPU pipeline.\n\n");
+        return;
+    }
+
+    auto device = capture.gpuDevice();
+    if (!device) {
+        capture.stop();
+        std::printf("  capture     NO -- duplication started, but not on a shared device.\n"
+                    "                    Usually two graphics adapters, or a driver that\n"
+                    "                    refused the texture. --verbose says which.\n\n"
+                    "Result: the CPU pipeline.\n\n");
+        return;
+    }
+    std::printf("  capture     yes -- %s\n", device->describe().c_str());
+
+    H264Encoder probe;
+    const bool takesGpu = probe.enableGpuInput(device);
+    std::printf("  encoder     %s -- %s\n", takesGpu ? "yes" : "NO ",
+                probe.describe().c_str());
+
+    if (!takesGpu) {
+        capture.stop();
+        std::printf("\n  This encoder is not D3D11-aware, so it can only be fed from\n"
+                    "  system memory. That is normal for the Microsoft software MFT.\n\n"
+                    "Result: the CPU pipeline.\n\n");
+        return;
+    }
+
+    Nv12GpuConverter conv;
+    const int w = capture.width() & ~1, h = capture.height() & ~1;
+    const bool shader = conv.init(device, w, h);
+    std::printf("  shader      %s -- BGRA to NV12 at %dx%d\n", shader ? "yes" : "NO ", w, h);
+    conv.reset();
+    capture.stop();
+
+    if (!shader) {
+        std::printf("\n  This device cannot render to NV12, so the conversion has to\n"
+                    "  happen on the CPU even though everything else lined up.\n\n"
+                    "Result: the CPU pipeline.\n\n");
+        return;
+    }
+
+    std::printf("\nResult: the GPU pipeline. `soi-share start --monitor %d` uses it\n"
+                "automatically; --gpu makes it an error if it ever stops being\n"
+                "available, and --cpu forces the SSE2 path instead.\n\n",
+                opt.monitorIndex);
 }
 
 // Windows consoles do not interpret ANSI escapes unless asked. Ask once, and
@@ -572,6 +751,13 @@ private:
 // the link estimate when choosing a frame rate.
 constexpr int kEncoderPeakPercent = 125;
 
+// The least time between two screen switches. Each one tears down a capture
+// backend and rebuilds the encoder, so this is both a courtesy to the person
+// watching -- who gets a settled picture instead of a flicker -- and the thing
+// that stops a viewer from turning a picker into a way to keep this machine
+// rebuilding its encoder. Short enough that a deliberate click feels immediate.
+constexpr auto kSwitchCooldown = std::chrono::milliseconds(750);
+
 // The ceiling congestion control is allowed to discover. Taken from the level
 // table so adding a level cannot leave the estimator clamped below it.
 int highestLevelBitrateKbps() {
@@ -598,7 +784,13 @@ public:
                     const Options& opt, int peerMaxMacroblocks)
         : streamer_(streamer), capture_(capture), capCfg_(capCfg), opt_(opt),
           srcW_(capture.width()), srcH_(capture.height()),
-          peerMaxMacroblocks_(peerMaxMacroblocks) {
+          peerMaxMacroblocks_(peerMaxMacroblocks),
+          // Decided ONCE, here, from what the operator asked for on the command
+          // line -- never from anything that arrives over the wire. A window
+          // share is locked unconditionally: widening "share this window" into
+          // "share this screen" on the strength of a message from the far end
+          // would hand the viewer more than the operator agreed to.
+          allowSwitch_(!opt.lockTarget && capCfg.target != CaptureTarget::Window) {
         const QualityLevel* wanted =
             opt.quality.empty() ? nullptr : findQualityLevel(opt.quality);
         level_ = wanted ? wanted : &defaultQualityLevel();
@@ -618,15 +810,23 @@ public:
         cfg.gopSeconds  = opt_.gopSeconds;
         cfg.quality     = 80;
 
+        // Put the encoder on the capture's own device, so its input texture and
+        // our output texture are the same kind of thing on the same adapter.
+        // Offered before start() because the answer changes how the MFT
+        // allocates. Null when the capture is on the CPU path -- including after
+        // a mid-session fall back to WGC or GDI, which is why this is asked
+        // again on every encoder rebuild rather than cached.
+        if (auto dev = capture_.gpuDevice()) encoder_.enableGpuInput(dev);
+
         if (!encoder_.start(cfg, [this](const uint8_t* nal, size_t len, bool key, int64_t pts) {
                 streamer_.sendFrame(nal, len, key, pts);
             }))
             return false;
 
-        logI("quality {}: {}x{} up to {} fps, {} at {} kbps",
+        logI("quality {}: {}x{} up to {} fps, {} at {} kbps, {} pipeline",
              level_->name, encW_, encH_, cfg.fps,
              encoder_.usesQualityRateControl() ? "peak-constrained VBR" : "CBR",
-             cfg.bitrateKbps);
+             cfg.bitrateKbps, encoder_.usesGpuInput() ? "GPU" : "CPU");
         encoder_.requestKeyframe();
         announce();
         return true;
@@ -637,15 +837,25 @@ public:
     // Applies anything the other threads asked for. Returns false if a rebuild
     // was needed and failed, which ends the session.
     bool tick() {
-        std::string wanted;
-        int wantedMonitor = -1;
+        std::string wanted, wantedKind;
+        int wantedIndex = -1;
         {
             std::lock_guard lk(mtx_);
             wanted.swap(pendingLevel_);
-            wantedMonitor = std::exchange(pendingMonitor_, -1);
+
+            // A switch costs an encoder rebuild, so only one is taken per
+            // cooldown. The rest of a burst collapses into the LATEST request
+            // rather than being dropped, so a viewer clicking twice quickly
+            // lands on the second screen -- and a viewer holding the key down
+            // cannot make this process rebuild the encoder in a tight loop.
+            if (!pendingKind_.empty() &&
+                std::chrono::steady_clock::now() - lastSwitch_ >= kSwitchCooldown) {
+                wantedKind.swap(pendingKind_);
+                wantedIndex = pendingIndex_;
+            }
         }
 
-        if (wantedMonitor >= 0 && !switchMonitor(wantedMonitor)) return false;
+        if (!wantedKind.empty() && !switchTarget(wantedKind, wantedIndex)) return false;
         if (!wanted.empty()) {
             if (const QualityLevel* next = findQualityLevel(wanted); next && next != level_) {
                 logI("viewer asked for {}", next->name);
@@ -671,6 +881,10 @@ public:
     }
 
     bool submit(const Nv12Buffer& frame, int64_t ptsNs) { return encoder_.submit(frame, ptsNs); }
+    bool submitTexture(void* bgra, int64_t ptsNs) {
+        return encoder_.submitTexture(static_cast<ID3D11Texture2D*>(bgra), ptsNs);
+    }
+    bool onGpu() const { return encoder_.usesGpuInput(); }
     void requestKeyframe() { encoder_.requestKeyframe(); }
 
     int encodeWidth()  const { return encW_; }
@@ -685,12 +899,13 @@ public:
         pendingLevel_ = name;
     }
 
-    // The viewer picking a different monitor. Validated on the capture thread
-    // against the live monitor list, so an index that no longer exists (someone
-    // unplugged a screen) is ignored rather than acted on.
-    void requestMonitor(int index) {
+    // The viewer picking something else to watch. Recorded only -- every check
+    // that matters happens on the capture thread, against the live state of the
+    // machine and the permission decided at construction.
+    void requestTarget(const std::string& kind, int index) {
         std::lock_guard lk(mtx_);
-        pendingMonitor_ = index;
+        pendingKind_  = kind;
+        pendingIndex_ = index;
     }
 
     // From REMB / receiver reports. Just recorded; the capture thread decides
@@ -708,50 +923,107 @@ public:
             levels += '"' + l.name + '"';
         }
 
-        // The monitor list is enumerated fresh every time rather than cached:
-        // screens get plugged in and unplugged while a share is running, and a
-        // viewer offering a monitor that no longer exists is worse than useless.
+        // What the viewer may switch to.
+        //
+        // When the share is locked this stays EMPTY, and that is the point: the
+        // list is not merely ignored on the way back in, it is never sent. It
+        // would otherwise tell a viewer who was given one window how many
+        // screens this PC has and how big each one is -- information the
+        // operator never offered, leaking out of a feature they did not enable.
+        //
+        // When switching IS allowed the list is enumerated fresh each time
+        // rather than cached: screens get plugged in and unplugged while a share
+        // is running, and offering one that no longer exists is worse than
+        // useless.
         std::string monitors;
-        for (const auto& m : enumerateMonitors()) {
-            if (!monitors.empty()) monitors += ',';
-            monitors += soi::format(R"({{"i":{},"w":{},"h":{},"primary":{}}})",
-                                    m.index, m.width, m.height, m.primary ? "true" : "false");
+        int screens = 0, deskW = 0, deskH = 0;
+        if (allowSwitch_) {
+            for (const auto& m : enumerateMonitors()) {
+                if (!monitors.empty()) monitors += ',';
+                monitors += soi::format(
+                    R"({{"i":{},"w":{},"h":{},"primary":{},"name":"{}"}})",
+                    m.index, m.width, m.height, m.primary ? "true" : "false",
+                    jsonEscape(m.name));
+                ++screens;
+            }
+            virtualDesktopSize(deskW, deskH);
         }
+
+        const char* kind = capCfg_.target == CaptureTarget::Window           ? "window"
+                           : capCfg_.target == CaptureTarget::VirtualDesktop ? "desktop"
+                                                                             : "monitor";
         const int current = capCfg_.target == CaptureTarget::Monitor ? capCfg_.monitorIndex : -1;
 
         streamer_.sendControl(soi::format(
             R"({{"type":"quality","level":"{}","w":{},"h":{},"fps":{},"levels":[{}],)"
-            R"("monitor":{},"monitors":[{}]}})",
-            level_->name, encW_, encH_, fps_, levels, current, monitors));
+            R"("target":"{}","monitor":{},"canSwitch":{},"screens":{},)"
+            R"("desktopW":{},"desktopH":{},"monitors":[{}]}})",
+            level_->name, encW_, encH_, fps_, levels,
+            kind, current, allowSwitch_ ? "true" : "false", screens,
+            deskW, deskH, monitors));
     }
 
 private:
-    // Move the capture to another monitor mid-session. The peer connection and
-    // the share code are untouched; only the pixels being read change. A new
-    // monitor usually has a different size, so the encode size and the encoder
-    // both have to be rebuilt -- same path a quality change takes.
-    bool switchMonitor(int index) {
-        const auto monitors = enumerateMonitors();
-        const auto found = std::find_if(monitors.begin(), monitors.end(),
-                                        [&](const MonitorInfo& m) { return m.index == index; });
-        if (found == monitors.end()) {
-            logW("viewer asked for monitor {}, which does not exist; ignoring", index);
-            announce();          // correct the viewer's idea of what is available
+    // Move the capture somewhere else mid-session. The peer connection, the
+    // share code and the viewer's page are all untouched; only the pixels being
+    // read change. A different screen usually has a different size, so the
+    // encode size and the encoder are rebuilt -- the same path a quality change
+    // takes.
+    //
+    // This runs on the capture thread and re-derives everything from scratch:
+    // the request carries a name and a number, and neither is believed until it
+    // has been matched against a permission decided before the peer existed and
+    // a monitor list read a moment ago.
+    //
+    // Returning false ends the session, so it is reserved for "the encoder is
+    // gone". A request that is refused, stale or simply impossible re-announces
+    // the true state and returns true -- the viewer keeps the picture they had.
+    bool switchTarget(const std::string& kind, int index) {
+        lastSwitch_ = std::chrono::steady_clock::now();   // capture thread only
+
+        if (!allowSwitch_) {
+            logW("the viewer asked for '{}' but this share is locked to its "
+                 "target; refusing", kind);
+            announce();          // correct the viewer's idea of what it may do
             return true;
         }
-        if (capCfg_.target == CaptureTarget::Monitor && capCfg_.monitorIndex == index)
-            return true;         // already there
-
-        logI("viewer asked for monitor {} ({}x{})", index, found->width, found->height);
 
         CaptureConfig next = capCfg_;
-        next.target       = CaptureTarget::Monitor;
-        next.monitorIndex = index;
         next.windowHandle = nullptr;
 
+        if (kind == "desktop") {
+            if (capCfg_.target == CaptureTarget::VirtualDesktop) return true;
+            int w = 0, h = 0;
+            virtualDesktopSize(w, h);
+            logI("viewer asked for every screen at once ({}x{})", w, h);
+            next.target = CaptureTarget::VirtualDesktop;
+        } else if (kind == "monitor") {
+            const auto monitors = enumerateMonitors();
+            const auto found = std::find_if(monitors.begin(), monitors.end(),
+                                            [&](const MonitorInfo& m) { return m.index == index; });
+            if (found == monitors.end()) {
+                logW("viewer asked for monitor {}, which does not exist; ignoring", index);
+                announce();      // correct the viewer's idea of what is available
+                return true;
+            }
+            if (capCfg_.target == CaptureTarget::Monitor && capCfg_.monitorIndex == index)
+                return true;     // already there
+            logI("viewer asked for monitor {} ({}x{})", index, found->width, found->height);
+            next.target       = CaptureTarget::Monitor;
+            next.monitorIndex = index;
+        } else {
+            logT("ignoring an unrecognised capture target '{}'", kind);
+            announce();
+            return true;
+        }
+
         if (!capture_.retarget(next)) {
-            logE("could not switch to monitor {}", index);
-            return false;
+            // retarget() restores the previous target before returning false, so
+            // the stream is still live. Ending the session over a screen that
+            // would not open is a worse answer than telling the viewer no.
+            logE("could not switch to the requested screen; staying where we are");
+            announce();
+            return true;
         }
         capCfg_ = next;
         srcW_ = capture_.width();
@@ -760,7 +1032,7 @@ private:
         recomputeSize();
         encoder_.stop();
         if (!startEncoder()) {
-            logE("could not restart the encoder after switching monitor");
+            logE("could not restart the encoder after switching screen");
             return false;
         }
         applyFrameRate(true);
@@ -835,10 +1107,19 @@ private:
     int fps_  = 30;
     int peerMaxMacroblocks_ = 0;   // 0 => the answer stated no usable constraint
 
+    // Fixed for the life of the session, from the operator's own command line.
+    // const so no later code path can talk itself into flipping it.
+    const bool allowSwitch_;
+
     std::atomic<int> available_{0};
     std::mutex       mtx_;
     std::string      pendingLevel_;
-    int              pendingMonitor_ = -1;
+    std::string      pendingKind_;         // empty => nothing pending
+    int              pendingIndex_ = -1;
+
+    // Capture thread only, so it needs no synchronisation of its own; it is read
+    // inside tick()'s lock merely because that is where the pending request is.
+    std::chrono::steady_clock::time_point lastSwitch_{};
 };
 
 // ---------------------------------------------------------------------------
@@ -872,7 +1153,9 @@ void runCaptureLoop(FrameSource& capture, QualityDirector& director, Streamer& s
         pacer.setFps(director.frameRate());
 
         const Frame* frame = capture.capture();
-        if (frame && frame->data) {
+        // Either kind of frame counts: on the GPU pipeline `data` is null and the
+        // pixels are a texture instead.
+        if (frame && (frame->data || frame->gpuTexture)) {
             ++captured;
             const auto now = std::chrono::steady_clock::now();
 
@@ -882,7 +1165,15 @@ void runCaptureLoop(FrameSource& capture, QualityDirector& director, Streamer& s
             const bool forced = (now - lastSent) >= idleRefresh;
             if (frame->duplicate && !forced) {
                 ++skipped;
-            } else {
+            } else if (frame->gpuTexture && director.onGpu()) {
+                // The GPU path. The frame never left the card: a shader on the
+                // encoder's own device converts it to NV12 and the texture goes
+                // straight into the MFT. Nothing to convert here, nothing to
+                // copy, and the downscale to the encoder's current size happens
+                // inside that same shader pass.
+                director.submitTexture(frame->gpuTexture, frame->timeNs);
+                lastSent = now;
+            } else if (frame->data) {
                 // Frames arrive at native resolution; the conversion pass box
                 // filters down to the ENCODER's current size in the same sweep,
                 // so a quality switch costs nothing extra here.
@@ -904,10 +1195,10 @@ void runCaptureLoop(FrameSource& capture, QualityDirector& director, Streamer& s
             prevFrames = s.framesSent;
 
             const std::string line = soi::format(
-                "{} {}x{} [{}] | {:.0f} kbps | {:.1f}/{:.1f} fps sent/cap (cap {}) | "
+                "{} {}x{} [{}/{}] | {:.0f} kbps | {:.1f}/{:.1f} fps sent/cap (cap {}) | "
                 "{} static | loss {:.1f}% | rtt {:.0f} ms | link {} kbps{}",
                 director.level().name, director.encodeWidth(), director.encodeHeight(),
-                backendName(capture.backend()),
+                backendName(capture.backend()), director.onGpu() ? "gpu" : "cpu",
                 kbps, fpsTx, captured / secs, director.frameRate(), skipped,
                 s.lossFraction * 100.0, s.rttMs, s.targetBitrateKbps,
                 s.rembSeen ? " [remb]" : "");
@@ -961,6 +1252,7 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
     capCfg.captureCursor  = opt.cursor;
     capCfg.includeLayered = opt.layered;
     capCfg.maxWidth       = opt.maxWidth;
+    capCfg.preferGpu      = opt.pipeline != Pipeline::Cpu;
 
     if (opt.target == CaptureTarget::Window) {
         capCfg.windowHandle = resolveWindowSpec(opt.windowSpec);
@@ -978,8 +1270,34 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
     if (!captureOwner->start()) return 1;
     FrameSource& capture = *captureOwner;
 
-    logI("colour conversion: {} path, {} worker(s)",
-         colorConvertUsesSimd() ? "SSSE3" : "scalar", sharedPool().size());
+    // --gpu is a demand, not a preference: if the frame cannot stay on the card
+    // then say so and stop, rather than running the CPU path under a flag that
+    // says otherwise. Auto is where the quiet fallback belongs.
+    if (opt.pipeline == Pipeline::Gpu && !capture.gpuDevice()) {
+        logE("--gpu was requested but this capture cannot keep frames on the GPU. "
+             "Run 'soi-share gpu-check' for the reason, or use --pipeline auto.");
+        return 1;
+    }
+
+    if (capture.gpuDevice())
+        logI("pipeline: GPU -- frames are converted and encoded without leaving "
+             "the graphics card");
+    else
+        logI("pipeline: CPU -- {} colour conversion, {} worker(s)",
+             colorConvertUsesSimd() ? "SSSE3" : "scalar", sharedPool().size());
+
+    // Say plainly, in the log, how much of this machine the far end can reach.
+    // "What am I actually sharing" should never need reasoning about.
+    if (opt.lockTarget || opt.target == CaptureTarget::Window) {
+        logI("locked to {} -- the viewer cannot change what is shared, and is "
+             "not told what else is on this PC", capture.describe());
+    } else {
+        int deskW = 0, deskH = 0;
+        virtualDesktopSize(deskW, deskH);
+        logI("the viewer may switch between {} screen(s) or all of them at once "
+             "({}x{}); --lock-target prevents this",
+             enumerateMonitors().size(), deskW, deskH);
+    }
 
     StreamerConfig netCfg;
     netCfg.stunUrls       = opt.stunUrls;
@@ -993,9 +1311,12 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
     // the very frames the viewer just asked for.
     netCfg.width  = capture.width();
     netCfg.height = capture.height();
-    if (opt.target == CaptureTarget::Monitor) {
-        for (const auto& m : enumerateMonitors()) {
-            int w = m.width, h = m.height;
+    // A locked share can only ever encode the one target it started on, so its
+    // advertised level is exactly that -- no reason to claim headroom for
+    // screens this session will never read.
+    if (opt.target != CaptureTarget::Window && !opt.lockTarget) {
+        auto consider = [&](int w, int h) {
+            if (w <= 0 || h <= 0) return;
             if (opt.maxWidth > 0 && w > opt.maxWidth) {
                 h = static_cast<int>(h * (static_cast<double>(opt.maxWidth) / w) + 0.5);
                 w = opt.maxWidth;
@@ -1005,7 +1326,16 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
                 netCfg.width  = w & ~1;
                 netCfg.height = h & ~1;
             }
-        }
+        };
+        for (const auto& m : enumerateMonitors()) consider(m.width, m.height);
+
+        // And every screen at once, which on a multi-monitor machine is larger
+        // than any single one of them. Leaving this out is what would make
+        // "all screens" the one choice in the picker that produces a frozen
+        // picture on a strict decoder.
+        int deskW = 0, deskH = 0;
+        virtualDesktopSize(deskW, deskH);
+        consider(deskW, deskH);
     }
     netCfg.fps            = opt.fps;
     // Likewise the congestion-control ceiling: it has to cover the highest
@@ -1217,7 +1547,9 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
     streamer.setQualityRequestHandler([&director](const std::string& level) {
         director.requestLevel(level);
     });
-    streamer.setMonitorRequestHandler([&director](int index) { director.requestMonitor(index); });
+    streamer.setTargetRequestHandler([&director](const std::string& kind, int index) {
+        director.requestTarget(kind, index);
+    });
     streamer.setControlReadyHandler([&director] { director.announce(); });
     director.requestKeyframe();   // the viewer cannot decode until the first IDR
 
@@ -1712,6 +2044,10 @@ int main(int argc, char** argv) {
         Options opt;
         if (!parseOptions(argc, argv, 2, opt)) { rc = 2; }
         else { logSetVerbose(opt.verbose); captureCheck(opt); }
+    } else if (cmd == "gpu-check") {
+        Options opt;
+        if (!parseOptions(argc, argv, 2, opt)) { rc = 2; }
+        else { logSetVerbose(opt.verbose); gpuCheck(opt); }
     } else if (cmd == "run") {
         Options opt;
         if (!parseOptions(argc, argv, 2, opt)) { rc = 2; }

@@ -90,12 +90,16 @@ public:
         cooldownUntil_.clear();
         if (select()) return true;
 
+        // Nothing can read the requested target. Go back to the one that was
+        // working and report failure -- the caller asked for a different screen,
+        // not for the share to end, but it must not be told it got one.
         logE("capture: could not switch target; restoring the previous one");
         stop();
         cfg_   = previous;
         order_ = preferenceOrder(cfg_);
         cooldownUntil_.clear();
-        return select();
+        if (!select()) logE("capture: the previous target did not come back either");
+        return false;
     }
 
     const Frame* capture() override {
@@ -137,6 +141,13 @@ public:
     }
     CaptureBackend backend() const override {
         return active_ ? active_->backend() : CaptureBackend::Auto;
+    }
+
+    // Forwarded, not cached: a mid-session switch to a backend that has no GPU
+    // path must report that honestly, or the caller keeps feeding textures to an
+    // encoder whose source has gone.
+    std::shared_ptr<GpuDevice> gpuDevice() const override {
+        return active_ ? active_->gpuDevice() : nullptr;
     }
 
 private:

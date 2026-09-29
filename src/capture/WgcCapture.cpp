@@ -364,10 +364,15 @@ bool WgcCapture::retarget(const CaptureConfig& cfg) {
     cfg_ = cfg;
     if (start()) return true;
 
+    // Restore, then report failure regardless. This is the case that matters
+    // most in practice: WGC has no capture item spanning several displays, so a
+    // viewer picking "all screens" while WGC is live MUST fall through to
+    // duplication rather than be told the switch succeeded.
     logE("wgc: could not switch capture target; restoring the previous one");
     stop();
     cfg_ = previous;
-    return start();
+    if (!start()) logE("wgc: the previous capture target did not come back either");
+    return false;
 }
 
 const Frame* WgcCapture::capture() {

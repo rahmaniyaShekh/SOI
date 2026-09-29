@@ -96,6 +96,7 @@ add_library(soi-core STATIC
     src/encode/ColorConvert.cpp
     src/encode/H264Encoder.cpp
     src/encode/Quality.cpp
+    src/gpu/GpuPipeline.cpp
     src/net/SignalBlob.cpp
     src/util/Log.cpp
 )
@@ -114,7 +115,11 @@ target_link_libraries(soi-core PUBLIC
     # Capture backends: d3d11/dxgi for Desktop Duplication, runtimeobject for the
     # WinRT activation Windows.Graphics.Capture needs. Both are inbox on every
     # supported Windows, so this adds no deployment requirement.
-    d3d11 dxgi runtimeobject
+    # d3d11/dxgi for Desktop Duplication, runtimeobject for the WinRT activation
+    # Windows.Graphics.Capture needs, d3dcompiler for the NV12 conversion shader
+    # the GPU pipeline compiles at run time. All three ship with Windows, so this
+    # adds no deployment requirement.
+    d3d11 dxgi runtimeobject d3dcompiler
     bcrypt
     ws2_32 iphlpapi winhttp
 )

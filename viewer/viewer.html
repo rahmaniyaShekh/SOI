@@ -48,6 +48,16 @@
     padding:9px 16px; font-size:13px; font-weight:600; cursor:pointer;
   }
   button.ghost { background:transparent; border:1px solid var(--border); color:var(--text); }
+
+  /* Pickers sit in the same row as the buttons, so their labels have to be
+     inline -- the sitewide `label` is a block with margins above it. */
+  .pick { display:inline-flex; align-items:center; gap:7px; }
+  .pick label { display:inline; margin:0; }
+  select {
+    background:#0b0e13; color:var(--text); border:1px solid var(--border);
+    border-radius:6px; padding:8px 10px; font-size:13px; font-family:inherit;
+  }
+  select:focus { outline:none; border-color:var(--accent); }
   button:disabled { opacity:.45; cursor:not-allowed; }
   button:not(:disabled):hover { filter:brightness(1.12); }
 
@@ -154,6 +164,14 @@
         <video id="video" autoplay playsinline muted></video>
       </div>
       <div class="row">
+        <span class="pick" id="screenWrap" hidden>
+          <label for="monitor">Screen</label>
+          <select id="monitor"></select>
+        </span>
+        <span class="pick" id="qualityWrap" hidden>
+          <label for="quality">Quality</label>
+          <select id="quality"></select>
+        </span>
         <button id="full" class="ghost">Fullscreen</button>
         <button id="key" class="ghost">Request keyframe</button>
         <button id="hangup" class="ghost">Disconnect</button>
@@ -294,6 +312,8 @@ const els = {
   msg: $('msg'), answerBox: $('answerBox'), answer: $('answer'), copy: $('copy'),
   stage: $('stage'), video: $('video'), status: $('status'), dot: $('dot'),
   full: $('full'), key: $('key'), hangup: $('hangup'),
+  screenWrap: $('screenWrap'), monitor: $('monitor'),
+  qualityWrap: $('qualityWrap'), quality: $('quality'),
 };
 
 let pc = null, control = null, statsTimer = null;
@@ -387,12 +407,95 @@ els.go.onclick = async () => {
   }
 };
 
+// ---------------------------------------------------------------------------
+// What the sender is sharing, and what else it is willing to share
+//
+// The sender announces this over the control channel whenever it changes, and
+// the announcement is the single source of truth: this page never assumes a
+// switch worked, it waits to be told. So a request the sender refuses simply
+// snaps the menu back to what is really on screen.
+// ---------------------------------------------------------------------------
+function sendControl(msg) {
+  if (control?.readyState === 'open') {
+    try { control.send(JSON.stringify(msg)); return true; } catch {}
+  }
+  return false;
+}
+
+function showControls(state) {
+  if (!state || !Array.isArray(state.levels) || !state.levels.length) {
+    els.qualityWrap.hidden = true;
+    els.screenWrap.hidden  = true;
+    return;
+  }
+
+  els.qualityWrap.hidden = false;
+  const sameLevels = els.quality.options.length === state.levels.length &&
+    [...els.quality.options].every((o, i) => o.value === state.levels[i]);
+  if (!sameLevels) {
+    els.quality.textContent = '';
+    for (const name of state.levels) {
+      const o = document.createElement('option');
+      o.value = name; o.textContent = name;
+      els.quality.appendChild(o);
+    }
+  }
+  if (state.level) els.quality.value = state.level;
+  if (state.w && state.h)
+    els.quality.title = `sending ${state.w}×${state.h} at up to ${state.fps} fps`;
+
+  // The screen list arrives empty when the sender is sharing a single window, or
+  // was started with --lock-target. That is the sender saying this viewer may
+  // see one thing and only that thing, so there is no picker to draw.
+  const screens = (state.canSwitch !== false && Array.isArray(state.monitors))
+    ? state.monitors : [];
+
+  // "All screens" is only a distinct choice when there is more than one screen,
+  // so a single-monitor sender gets no control rather than a menu of one.
+  const choices = screens.length >= 2
+    ? [{ v: 'desktop', t: `All ${screens.length} screens · ${state.desktopW}×${state.desktopH}` }]
+        .concat(screens.map(m => (
+          { v: String(m.i), t: `Screen ${m.i + 1} · ${m.w}×${m.h}${m.primary ? ' (main)' : ''}` })))
+    : [];
+
+  els.screenWrap.hidden = !choices.length;
+  if (!choices.length) return;
+
+  // Rebuilt only when the sender's screens actually change, so a routine
+  // re-announce does not yank the menu out from under an open dropdown.
+  const want = choices.map(c => c.v + ':' + c.t).join('|');
+  if (els.monitor.dataset.ids !== want) {
+    els.monitor.dataset.ids = want;
+    els.monitor.textContent = '';
+    for (const c of choices) {
+      const o = document.createElement('option');
+      o.value = c.v; o.textContent = c.t;
+      els.monitor.appendChild(o);
+    }
+  }
+  els.monitor.title = `The sharing PC has ${screens.length} screens attached`;
+
+  const now = state.target === 'desktop' ? 'desktop' : String(state.monitor);
+  if (choices.some(c => c.v === now)) els.monitor.value = now;
+}
+
+els.monitor.onchange = () => {
+  const v = els.monitor.value;
+  const msg = v === 'desktop'
+    ? { type: 'setTarget', kind: 'desktop' }
+    : { type: 'setTarget', kind: 'monitor', index: Number(v) };
+  if (sendControl(msg))
+    say(v === 'desktop' ? 'Switching to all screens…' : 'Switching screen…', 'info');
+};
+
+els.quality.onchange = () => {
+  if (sendControl({ type: 'setQuality', level: els.quality.value }))
+    say('Changing quality…', 'info');
+};
+
 els.full.onclick  = () => els.video.requestFullscreen?.();
 els.key.onclick   = () => {
-  if (control?.readyState === 'open') {
-    control.send(JSON.stringify({ type: 'keyframe' }));
-    say('Keyframe requested.', 'info');
-  }
+  if (sendControl({ type: 'keyframe' })) say('Keyframe requested.', 'info');
 };
 els.hangup.onclick = () => { teardown(); setStatus('disconnected'); };
 
@@ -401,6 +504,7 @@ function teardown() {
   if (control) { try { control.close(); } catch {} control = null; }
   if (pc) { try { pc.close(); } catch {} pc = null; }
   els.stage.classList.remove('show');
+  showControls(null);   // nothing is being shared, so nothing is selectable
   els.go.disabled = false;
 }
 
@@ -440,13 +544,18 @@ async function connect(offerBlob, passphrase) {
   };
 
   pc.ondatachannel = ev => {
-    control = ev.channel;
-    control.onmessage = e => {
+    const ch = ev.channel;
+    control = ch;
+    ch.onmessage = e => {
       try {
         const m = JSON.parse(e.data);
         if (m.type === 'hello') say(`Connected to a ${m.w}×${m.h} @ ${m.fps}fps share.`, 'ok');
+        // The sender re-announces on every change, so this is also how the menu
+        // learns that a screen was unplugged mid-session.
+        if (m.type === 'quality') showControls(m);
       } catch {}
     };
+    ch.onclose = () => { if (control === ch) { control = null; showControls(null); } };
   };
 
   pc.onconnectionstatechange = () => {

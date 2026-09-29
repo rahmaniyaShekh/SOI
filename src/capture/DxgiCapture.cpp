@@ -207,11 +207,85 @@ bool DxgiCapture::collectOutputs() {
     return true;
 }
 
+// Every reason this returns false is an ordinary property of the machine or the
+// options, not a fault, so it logs at trace and the caller carries on with the
+// CPU path. --gpu is what turns "we quietly did not" into an error, and it does
+// that in main.cpp where the user's intent is known.
+bool DxgiCapture::setUpGpu() {
+    gpu_.reset();
+    gpuDesktop_.reset();
+
+    if (!cfg_.preferGpu) return false;
+
+    // The cursor is drawn with GDI onto CPU pixels. Keeping the frame on the
+    // card means there are no CPU pixels, so the two are mutually exclusive and
+    // the explicit request wins.
+    if (cfg_.captureCursor) {
+        logI("gpu: --cursor needs CPU pixels to draw on; using the CPU pipeline");
+        return false;
+    }
+
+    if (outputs_.empty()) return false;
+
+    // One device can only duplicate outputs on its own adapter. Spanning two
+    // adapters would need a shared texture and a cross-adapter copy, which costs
+    // about what the readback we are avoiding costs.
+    LUID first{};
+    for (size_t i = 0; i < outputs_.size(); ++i) {
+        DXGI_ADAPTER_DESC ad{};
+        if (!outputs_[i]->adapter || FAILED(outputs_[i]->adapter->GetDesc(&ad))) return false;
+        if (i == 0) { first = ad.AdapterLuid; continue; }
+        if (ad.AdapterLuid.LowPart != first.LowPart ||
+            ad.AdapterLuid.HighPart != first.HighPart) {
+            logI("gpu: this target spans two graphics adapters; using the CPU pipeline");
+            return false;
+        }
+    }
+
+    auto dev = GpuDevice::create(outputs_[0]->adapter.get());
+    if (!dev) return false;
+
+    // The composed desktop, at native size. SHADER_RESOURCE because the NV12
+    // shader reads it, RENDER_TARGET only so start() can clear it once -- the
+    // outputs themselves are blitted in with CopySubresourceRegion, not drawn.
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width            = static_cast<UINT>(srcW_);
+    td.Height           = static_cast<UINT>(srcH_);
+    td.MipLevels        = 1;
+    td.ArraySize        = 1;
+    td.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage            = D3D11_USAGE_DEFAULT;
+    td.BindFlags        = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+    ComPtr<ID3D11Texture2D> composed;
+    if (FAILED(dev->device()->CreateTexture2D(&td, nullptr, composed.put()))) {
+        logT("dxgi: could not create the {}x{} composed GPU texture", srcW_, srcH_);
+        return false;
+    }
+
+    gpu_        = std::move(dev);
+    gpuDesktop_ = std::move(composed);
+    logI("gpu: capture stays on {} ({}x{} BGRA, {} output(s))",
+         gpu_->describe(), srcW_, srcH_, outputs_.size());
+    return true;
+}
+
 bool DxgiCapture::openDuplication(Output& o) {
     o.dup.reset();
     o.staging.reset();
     o.stagingW = o.stagingH = 0;
     o.stagingFormat = DXGI_FORMAT_UNKNOWN;
+
+    // On the GPU pipeline every output duplicates onto the ONE shared device, so
+    // its texture and the encoder's are on the same device and can be handed
+    // over without a copy. That is the whole reason the device is shared.
+    if (gpu_) {
+        o.device.attach(gpu_->device());
+        o.device->AddRef();
+        o.context.attach(gpu_->context());
+        o.context->AddRef();
+    }
 
     if (!o.device) {
         HRESULT hr = D3D11CreateDevice(o.adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
@@ -302,8 +376,11 @@ bool DxgiCapture::pumpOutput(Output& o, int timeoutMs) {
     D3D11_TEXTURE2D_DESC td{};
     tex->GetDesc(&td);
 
-    if (!o.staging || td.Width != o.stagingW || td.Height != o.stagingH ||
-        td.Format != o.stagingFormat) {
+    // Not on the GPU path: there is nothing to read back, so there is nothing to
+    // stage. Allocating one anyway would cost a full-frame surface per output
+    // for no reason.
+    if (!gpu_ && (!o.staging || td.Width != o.stagingW || td.Height != o.stagingH ||
+                  td.Format != o.stagingFormat)) {
         D3D11_TEXTURE2D_DESC sd{};
         sd.Width          = td.Width;
         sd.Height         = td.Height;
@@ -335,6 +412,27 @@ bool DxgiCapture::pumpOutput(Output& o, int timeoutMs) {
         return false;
     }
 
+    // --- the GPU path: stay on the card ------------------------------------
+    //
+    // Blit this output into its own rectangle of the composed desktop texture
+    // and stop. No staging texture, no Map, nothing across the bus. The copy
+    // itself is not avoidable: ReleaseFrame (the FrameGuard above) invalidates
+    // the acquired texture the moment this returns, so its pixels have to live
+    // somewhere we own.
+    if (gpu_ && gpuDesktop_) {
+        const UINT w = std::min<UINT>(td.Width,  static_cast<UINT>(o.w));
+        const UINT h = std::min<UINT>(td.Height, static_cast<UINT>(o.h));
+        const D3D11_BOX box{0, 0, 0, w, h, 1};
+
+        std::lock_guard lk(gpu_->contextMutex());
+        o.context->CopySubresourceRegion(gpuDesktop_.get(), 0,
+                                         static_cast<UINT>(o.dstX),
+                                         static_cast<UINT>(o.dstY), 0,
+                                         tex.get(), 0, &box);
+        o.primed = true;
+        return true;
+    }
+
     o.context->CopyResource(o.staging.get(), tex.get());
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -363,14 +461,38 @@ bool DxgiCapture::start() {
 
     if (!collectOutputs()) return false;
 
-    if (!desktop_.resize(srcW_, srcH_)) {
+    // Before the duplications open, because it decides which device they open
+    // on. Failure here is not failure to start -- it just means the CPU path.
+    setUpGpu();
+
+    // The CPU-side surfaces are pure waste on the GPU path: nothing ever reads
+    // or writes them.
+    if (!gpu_ && !desktop_.resize(srcW_, srcH_)) {
         logE("dxgi: could not allocate a {}x{} frame buffer", srcW_, srcH_);
         return false;
     }
     // A virtual desktop is not necessarily a rectangle -- two monitors of
     // different heights leave a gap that no output covers. Black is the honest
     // value for it, and clearing once means those pixels are never garbage.
-    desktop_.fillBlack();
+    //
+    // The GPU texture needs the same treatment for the same reason, and D3D
+    // gives no guarantee about a freshly created texture's contents. Clearing it
+    // needs a render target view, so it is done once here rather than kept
+    // around.
+    if (gpu_) {
+        D3D11_RENDER_TARGET_VIEW_DESC rv{};
+        rv.Format        = DXGI_FORMAT_B8G8R8A8_UNORM;
+        rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        ComPtr<ID3D11RenderTargetView> clearView;
+        if (SUCCEEDED(gpu_->device()->CreateRenderTargetView(gpuDesktop_.get(), &rv,
+                                                             clearView.put()))) {
+            const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            std::lock_guard lk(gpu_->contextMutex());
+            gpu_->context()->ClearRenderTargetView(clearView.get(), black);
+        }
+    } else {
+        desktop_.fillBlack();
+    }
 
     if (cfg_.captureCursor && !composed_.resize(srcW_, srcH_)) {
         logE("dxgi: could not allocate the cursor compositing buffer");
@@ -427,10 +549,15 @@ bool DxgiCapture::start() {
 }
 
 void DxgiCapture::stop() {
+    // Outputs first: each holds a reference to the shared device, and the
+    // duplications must be gone before the device they were made on.
     outputs_.clear();
+    gpuDesktop_.reset();
+    gpu_.reset();
     desktop_.release();
     composed_.release();
     started_ = false;
+    frame_ = Frame{};
     lastCursor_ = POINT{-1, -1};
     lastCursorShown_ = false;
 }
@@ -442,10 +569,13 @@ bool DxgiCapture::retarget(const CaptureConfig& cfg) {
     cfg_ = cfg;
     if (start()) return true;
 
+    // Restore, then report failure regardless -- see BitBltCapture::retarget for
+    // why the answer is "am I on the requested target", not "am I alive".
     logE("dxgi: could not switch capture target; restoring the previous one");
     stop();
     cfg_ = previous;
-    return start();
+    if (!start()) logE("dxgi: the previous capture target did not come back either");
+    return false;
 }
 
 const Frame* DxgiCapture::capture() {
@@ -483,6 +613,21 @@ const Frame* DxgiCapture::capture() {
     // whether to wait it out or change backend.
     if (!live || !primed) return nullptr;
 
+    // The GPU path: the composed texture IS the frame. No pixels come back, so
+    // there is no cursor to composite (setUpGpu refused --cursor) and no hash to
+    // take -- duplication already told us whether anything changed, which is
+    // both cheaper and exact.
+    if (gpu_) {
+        frame_.data       = nullptr;
+        frame_.gpuTexture = gpuDesktop_.get();
+        frame_.width      = srcW_;
+        frame_.height     = srcH_;
+        frame_.stride     = 0;
+        frame_.timeNs     = nowNs();
+        frame_.duplicate  = cfg_.detectDuplicates && !changed;
+        return &frame_;
+    }
+
     const uint8_t* pixels = desktop_.pixels();
     int            stride = desktop_.stride();
 
@@ -508,7 +653,8 @@ const Frame* DxgiCapture::capture() {
         stride = composed_.stride();
     }
 
-    frame_.data      = pixels;
+    frame_.data       = pixels;
+    frame_.gpuTexture = nullptr;
     frame_.width     = srcW_;
     frame_.height    = srcH_;
     frame_.stride    = stride;

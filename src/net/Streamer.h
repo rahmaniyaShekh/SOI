@@ -63,8 +63,11 @@ public:
     // The viewer asking for a different quality level, by name. Invoked on the
     // data-channel thread, so the handler must not block.
     using QualityRequestFn  = std::function<void(const std::string& level)>;
-    // The viewer picking a different monitor to watch, by index.
-    using MonitorRequestFn  = std::function<void(int index)>;
+    // The viewer picking something else to watch: "monitor" with an index, or
+    // "desktop" for every screen at once. Nothing here is trusted -- the handler
+    // re-checks the request against the live monitor list AND against whether
+    // the operator permitted switching at all.
+    using TargetRequestFn   = std::function<void(const std::string& kind, int index)>;
     // Fired when the control channel opens, so the sender can announce the
     // levels on offer and which one is currently running.
     using ControlReadyFn    = std::function<void()>;
@@ -98,7 +101,7 @@ public:
     void setBitrateTargetHandler(BitrateTargetFn fn)     { onBitrate_  = std::move(fn); }
     void setStateHandler(StateFn fn)                     { onState_    = std::move(fn); }
     void setQualityRequestHandler(QualityRequestFn fn)   { onQuality_  = std::move(fn); }
-    void setMonitorRequestHandler(MonitorRequestFn fn)   { onMonitor_  = std::move(fn); }
+    void setTargetRequestHandler(TargetRequestFn fn)     { onTarget_   = std::move(fn); }
     void setControlReadyHandler(ControlReadyFn fn)       { onControlReady_ = std::move(fn); }
 
     bool controlIsOpen() const;
@@ -136,7 +139,7 @@ private:
     BitrateTargetFn   onBitrate_;
     StateFn           onState_;
     QualityRequestFn  onQuality_;
-    MonitorRequestFn  onMonitor_;
+    TargetRequestFn   onTarget_;
     ControlReadyFn    onControlReady_;
 
     // Stats / control state.

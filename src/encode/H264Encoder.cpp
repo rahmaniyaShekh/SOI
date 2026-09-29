@@ -8,6 +8,7 @@
 #include <mferror.h>
 #include <codecapi.h>
 #include <wmcodecdsp.h>
+#include <d3d11.h>
 
 #include <algorithm>
 #include <cstring>
@@ -129,6 +130,73 @@ bool H264Encoder::selectTransform() {
     return tryEnum(MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER, false);
 }
 
+// Ask the selected MFT to take its input as D3D11 surfaces on our device.
+//
+// Silent about everything except an outright failure to talk to a transform that
+// said it was D3D11-aware: "this encoder is not D3D11-aware" is an ordinary
+// property of the Microsoft software MFT and of some older hardware ones, not a
+// problem to report. The caller learns the outcome from usesGpuInput().
+void H264Encoder::attachD3dManager() {
+    gpuInput_ = false;
+    if (!gpuRequested_ || !gpuDevice_ || !mft_) return;
+
+    ComPtr<IMFAttributes> attrs;
+    if (FAILED(mft_->GetAttributes(attrs.put())) || !attrs) return;
+
+    if (MFGetAttributeUINT32(attrs.get(), MF_SA_D3D11_AWARE, 0) == 0) {
+        logI("encoder: {} does not take D3D11 input; using the CPU converter",
+             description_);
+        return;
+    }
+
+    UINT resetToken = 0;
+    if (FAILED(MFCreateDXGIDeviceManager(&resetToken, gpuManager_.put())) || !gpuManager_) {
+        logW("gpu: could not create a DXGI device manager; using the CPU converter");
+        return;
+    }
+    HRESULT hr = gpuManager_->ResetDevice(gpuDevice_->device(), resetToken);
+    if (FAILED(hr)) {
+        logW("gpu: the device manager rejected our D3D11 device: {}", hrString(hr));
+        gpuManager_.reset();
+        return;
+    }
+
+    // ULONG_PTR, not a pointer: the MFT AddRefs the manager itself.
+    hr = mft_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
+                              reinterpret_cast<ULONG_PTR>(gpuManager_.get()));
+    if (FAILED(hr)) {
+        // A transform that advertised MF_SA_D3D11_AWARE and then refused the
+        // manager is worth saying out loud -- it usually means the device is on
+        // an adapter the encoder cannot reach.
+        logW("gpu: {} advertised D3D11 support but refused the device: {}",
+             description_, hrString(hr));
+        gpuManager_.reset();
+        return;
+    }
+
+    gpuInput_ = true;
+}
+
+bool H264Encoder::enableGpuInput(const std::shared_ptr<GpuDevice>& device) {
+    if (running_.load()) return false;
+    if (!device) return false;
+
+    // The transform has to exist before we can ask whether it is D3D11-aware, so
+    // select it now. start() reuses whatever this leaves behind.
+    if (!mft_ && !selectTransform()) return false;
+
+    ComPtr<IMFAttributes> attrs;
+    if (FAILED(mft_->GetAttributes(attrs.put())) || !attrs ||
+        MFGetAttributeUINT32(attrs.get(), MF_SA_D3D11_AWARE, 0) == 0) {
+        logI("encoder: {} cannot take GPU input", description_);
+        return false;
+    }
+
+    gpuDevice_    = device;
+    gpuRequested_ = true;
+    return true;
+}
+
 bool H264Encoder::configureTypes() {
     // Hardware MFTs are asynchronous and must be unlocked before any other call.
     ComPtr<IMFAttributes> attrs;
@@ -143,6 +211,13 @@ bool H264Encoder::configureTypes() {
         }
         attrs->SetUINT32(MF_LOW_LATENCY, TRUE);   // best-effort
     }
+
+    // The D3D device has to be handed over HERE: after the async unlock, because
+    // a locked MFT rejects every call, and before the media types, because that
+    // is when the MFT decides how it will allocate its input. Sending it later
+    // is accepted and then quietly ignored, which looks exactly like the GPU
+    // path working while every frame is still being copied through memory.
+    attachD3dManager();
 
     DWORD inIds[1] = {0}, outIds[1] = {0};
     if (SUCCEEDED(mft_->GetStreamIDs(1, inIds, 1, outIds))) {
@@ -320,7 +395,8 @@ bool H264Encoder::start(const EncoderConfig& cfg, OutputCallback onOutput) {
     cfg_.width  &= ~1;
     cfg_.height &= ~1;
 
-    if (!selectTransform()) {
+    // enableGpuInput() may already have selected one in order to interrogate it.
+    if (!mft_ && !selectTransform()) {
         logE("no H.264 encoder MFT found (NV12 in, H264 out)");
         return false;
     }
@@ -328,16 +404,31 @@ bool H264Encoder::start(const EncoderConfig& cfg, OutputCallback onOutput) {
     if (!configureCodecApi()) { mft_.reset(); return false; }
     if (!beginStreaming())  { mft_.reset(); return false; }
 
+    // The converter is built last, at the size the encoder was actually
+    // configured for, so a resolution change rebuilds both together.
+    if (gpuInput_ && !gpuConverter_.init(gpuDevice_, cfg_.width, cfg_.height)) {
+        // The MFT holds our device either way, and every D3D11-aware MFT still
+        // accepts system-memory samples, so dropping back here is safe rather
+        // than fatal.
+        logW("gpu: NV12 conversion is unavailable at {}x{}; using the CPU converter",
+             cfg_.width, cfg_.height);
+        gpuInput_ = false;
+    }
+
     cacheSequenceHeader();
 
-    logI("encoder: {} {}x{} @{}fps target {} kbps, GOP {}s, mode {}",
+    logI("encoder: {} {}x{} @{}fps target {} kbps, GOP {}s, mode {}, input {}",
          description_, cfg_.width, cfg_.height, cfg_.fps, cfg_.bitrateKbps,
-         cfg_.gopSeconds, async_ ? "async" : "sync");
+         cfg_.gopSeconds, async_ ? "async" : "sync",
+         gpuInput_ ? "GPU textures (zero-copy)" : "system memory");
     return true;
 }
 
 void H264Encoder::stop() {
     if (!running_.exchange(false)) {
+        gpuConverter_.reset();
+        gpuManager_.reset();
+        gpuInput_ = false;
         mft_.reset();
         events_.reset();
         codec_.reset();
@@ -362,6 +453,12 @@ void H264Encoder::stop() {
         needInput_ = 0;
     }
 
+    // The converter's textures are still referenced by any sample the MFT has
+    // not finished with, so it goes after the drain above, never before.
+    gpuConverter_.reset();
+    gpuManager_.reset();
+    gpuInput_ = false;
+
     events_.reset();
     codec_.reset();
     mft_.reset();
@@ -385,10 +482,51 @@ bool H264Encoder::submit(const Nv12Buffer& frame, int64_t ptsNs) {
     buffer->Unlock();
     buffer->SetCurrentLength(static_cast<DWORD>(frame.size()));
 
+    return dispatch(buffer.get(), ptsNs);
+}
+
+bool H264Encoder::submitTexture(ID3D11Texture2D* bgra, int64_t ptsNs) {
+    if (!running_.load() || !mft_ || !gpuInput_ || !bgra) return false;
+
+    // Capture texture -> NV12 texture, on the GPU, no readback.
+    ID3D11Texture2D* nv12 = gpuConverter_.convert(bgra);
+    if (!nv12) {
+        framesDropped_.fetch_add(1);
+        return false;
+    }
+
+    // Wrap the texture as an MF buffer. This takes a reference on the texture,
+    // which is exactly why the converter hands out a ring rather than one
+    // surface: the encoder is still reading this frame when the next arrives.
+    ComPtr<IMFMediaBuffer> buffer;
+    HRESULT hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12, 0, FALSE,
+                                           buffer.put());
+    if (FAILED(hr)) {
+        logT("gpu: MFCreateDXGISurfaceBuffer failed: {}", hrString(hr));
+        framesDropped_.fetch_add(1);
+        return false;
+    }
+
+    // A DXGI buffer starts with a current length of zero, and an MFT handed a
+    // zero-length sample silently encodes nothing. IMF2DBuffer knows the real
+    // size including the driver's row padding, so ask it rather than computing
+    // w*h*3/2 and hoping the stride matches.
+    ComPtr<IMF2DBuffer> twoD;
+    DWORD length = 0;
+    if (SUCCEEDED(buffer.as(twoD)) && SUCCEEDED(twoD->GetContiguousLength(&length)))
+        buffer->SetCurrentLength(length);
+
+    return dispatch(buffer.get(), ptsNs);
+}
+
+// Everything after "we have a buffer": wrap it in a sample, and either drive the
+// MFT directly (sync) or queue it for the event thread (async). Shared so the
+// system-memory and GPU paths cannot drift apart in their drop policy.
+bool H264Encoder::dispatch(::IMFMediaBuffer* buffer, int64_t ptsNs) {
     ComPtr<IMFSample> sample;
-    hr = MFCreateSample(sample.put());
+    HRESULT hr = MFCreateSample(sample.put());
     if (FAILED(hr)) return false;
-    sample->AddBuffer(buffer.get());
+    sample->AddBuffer(buffer);
     sample->SetSampleTime(ptsNs / 100);                       // MF uses 100ns units
     sample->SetSampleDuration(10'000'000LL / std::max(1, cfg_.fps));
 

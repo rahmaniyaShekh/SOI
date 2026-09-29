@@ -689,8 +689,8 @@ void testCapture() {
         missing.monitorIndex = 99;
         const int wasW = capture.width(), wasH = capture.height();
 
-        check(capture.retarget(missing),
-              "a retarget to a monitor that does not exist still leaves a live capture");
+        check(!capture.retarget(missing),
+              "a retarget to a monitor that does not exist reports failure");
         check(capture.width() == wasW && capture.height() == wasH,
               "and restores the previous target exactly",
               soi::format("{}x{} -> {}x{}", wasW, wasH, capture.width(), capture.height()));
@@ -946,12 +946,31 @@ void testCaptureBackends() {
             CaptureConfig missing = cfg;
             missing.monitorIndex = 99;
             const int wasW = src->width(), wasH = src->height();
-            check(src->retarget(missing),
-                  "a retarget to a monitor that does not exist leaves a live capture");
+            check(!src->retarget(missing),
+                  "a retarget to a monitor that does not exist reports failure");
             check(src->width() == wasW && src->height() == wasH,
                   "and restores the previous target exactly",
                   soi::format("{}x{} -> {}x{}", wasW, wasH, src->width(), src->height()));
             check(captureUntilContent(*src) != nullptr, "and still captures afterwards");
+
+            // "All screens" is what a viewer picks from the browser, and on a
+            // multi-monitor PC it is the one target WGC cannot serve -- so this
+            // is the path that proves a refused leaf backend really does fall
+            // through to one that can, instead of reporting a switch it did not
+            // make. On a single-monitor machine it is a plain no-op.
+            CaptureConfig everything = cfg;
+            everything.target = CaptureTarget::VirtualDesktop;
+            check(src->retarget(everything),
+                  "retargets to every screen at once",
+                  soi::format("{}x{} via {}", src->width(), src->height(),
+                              backendName(src->backend())));
+            check(captureUntilContent(*src) != nullptr,
+                  "and captures real content from all screens");
+            check(src->width() >= wasW && src->height() >= wasH,
+                  "which is at least as large as the single screen it replaced",
+                  soi::format("{}x{} -> {}x{}", wasW, wasH, src->width(), src->height()));
+
+            src->retarget(cfg);
         }
         src->stop();
     }
@@ -1651,6 +1670,269 @@ void testProtectionAllModes() {
 // ---------------------------------------------------------------------------
 // Encoder
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// The GPU pipeline, end to end.
+//
+// Everything else about this path can look right and still produce nothing: the
+// shader can compile, the device can be shared, the MFT can accept the D3D
+// manager -- and if the NV12 render target views address the wrong plane, or the
+// DXGI buffer goes in with a zero length, the encoder emits a green rectangle or
+// no bytes at all and says so to nobody.
+//
+// So this drives the real thing: duplicate the real screen onto the GPU, convert
+// with the real shader, hand the real texture to the real hardware encoder, and
+// insist on an H.264 bitstream coming out the other side.
+// ---------------------------------------------------------------------------
+// The shader's arithmetic, against the same reference values the SSE2 path is
+// held to (black -> 16, white -> 235, grey chroma exactly 128).
+//
+// This is the check the end-to-end test cannot make. A shader that writes the
+// Y plane into the UV view, or uses BT.601, or gets the limited-range scaling
+// wrong, still encodes to a plausible number of bytes -- it just looks wrong,
+// and nothing but a human would notice. Reading the NV12 back here (test only;
+// the real path never does) turns that into an assertion.
+void testGpuConvert() {
+    section("GPU BGRA -> NV12 shader (BT.709 limited)");
+
+    auto device = GpuDevice::create(nullptr);
+    if (!device) { info("no D3D11 device available; skipped"); return; }
+    info("device: " + device->describe());
+
+    constexpr int kW = 64, kH = 64;
+
+    // Four quadrants of known colour. Quadrant-sized rather than per-pixel so
+    // the box filter has a flat interior to average, and any plane mix-up moves
+    // a whole block rather than a sliver.
+    struct Quad { uint8_t b, g, r; const char* name; int wantY; };
+    const Quad quads[4] = {
+        {0,   0,   0,   "black", 16},
+        {255, 255, 255, "white", 235},
+        {128, 128, 128, "grey",  126},   // 16 + 219*(128/255)
+        {0,   0,   255, "red",    63},   // 16 + 219*0.2126
+    };
+
+    std::vector<uint32_t> src(static_cast<size_t>(kW) * kH);
+    for (int y = 0; y < kH; ++y)
+        for (int x = 0; x < kW; ++x) {
+            const Quad& q = quads[(y < kH / 2 ? 0 : 2) + (x < kW / 2 ? 0 : 1)];
+            src[static_cast<size_t>(y) * kW + x] =
+                (0xFFu << 24) | (static_cast<uint32_t>(q.r) << 16) |
+                (static_cast<uint32_t>(q.g) << 8) | q.b;
+        }
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = kW; td.Height = kH; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    D3D11_SUBRESOURCE_DATA init{};
+    init.pSysMem = src.data();
+    init.SysMemPitch = kW * 4;
+
+    ComPtr<ID3D11Texture2D> source;
+    if (FAILED(device->device()->CreateTexture2D(&td, &init, source.put()))) {
+        info("could not create the source texture; skipped");
+        return;
+    }
+
+    Nv12GpuConverter conv;
+    if (!conv.init(device, kW, kH)) {
+        info("this device cannot render NV12; skipped");
+        return;
+    }
+
+    ID3D11Texture2D* nv12 = conv.convert(source.get());
+    check(nv12 != nullptr, "the shader converts a BGRA texture to NV12");
+    if (!nv12) return;
+
+    // Read it back. Only the test does this -- it is precisely the bus crossing
+    // the GPU pipeline exists to avoid.
+    D3D11_TEXTURE2D_DESC sd{};
+    nv12->GetDesc(&sd);
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+    ComPtr<ID3D11Texture2D> staging;
+    if (FAILED(device->device()->CreateTexture2D(&sd, nullptr, staging.put()))) {
+        info("could not create a staging texture to read the result back");
+        return;
+    }
+
+    D3D11_MAPPED_SUBRESOURCE map{};
+    {
+        std::lock_guard lk(device->contextMutex());
+        device->context()->CopyResource(staging.get(), nv12);
+        if (FAILED(device->context()->Map(staging.get(), 0, D3D11_MAP_READ, 0, &map))) {
+            info("could not map the NV12 result");
+            return;
+        }
+    }
+
+    const auto* base = static_cast<const uint8_t*>(map.pData);
+    const int   pitch = static_cast<int>(map.RowPitch);
+    // NV12 is planar: the UV plane starts exactly `height` rows after Y.
+    const uint8_t* yPlane  = base;
+    const uint8_t* uvPlane = base + static_cast<size_t>(pitch) * kH;
+
+    auto sampleY = [&](int x, int y) { return yPlane[static_cast<size_t>(y) * pitch + x]; };
+
+    bool lumaOk = true;
+    std::string detail;
+    for (int q = 0; q < 4; ++q) {
+        // Well inside each quadrant, away from the seam the box filter blends.
+        const int x = (q % 2 == 0 ? kW / 4 : kW * 3 / 4);
+        const int y = (q < 2 ? kH / 4 : kH * 3 / 4);
+        const int got = sampleY(x, y);
+        if (std::abs(got - quads[q].wantY) > 2) lumaOk = false;
+        detail += soi::format("{} {}(want {}) ", quads[q].name, got, quads[q].wantY);
+    }
+    check(lumaOk, "luma matches the BT.709 limited-range reference", detail);
+
+    // Grey is the sharpest chroma test there is: any hue error at all moves U or
+    // V off 128, and a BT.601 matrix would not land here either.
+    const int greyX = kW / 4, greyY = kH * 3 / 4;
+    const int u = uvPlane[static_cast<size_t>(greyY / 2) * pitch + (greyX / 2) * 2];
+    const int v = uvPlane[static_cast<size_t>(greyY / 2) * pitch + (greyX / 2) * 2 + 1];
+    check(std::abs(u - 128) <= 1 && std::abs(v - 128) <= 1,
+          "grey is exactly neutral chroma, so the UV plane is addressed correctly",
+          soi::format("U={} V={}", u, v));
+
+    // Red must push V well above neutral and U below it. This is the assertion
+    // that fails outright if the two chroma channels are swapped.
+    const int redX = kW * 3 / 4, redY = kH * 3 / 4;
+    const int ru = uvPlane[static_cast<size_t>(redY / 2) * pitch + (redX / 2) * 2];
+    const int rv = uvPlane[static_cast<size_t>(redY / 2) * pitch + (redX / 2) * 2 + 1];
+    check(rv > 180 && ru < 120,
+          "red lands on the right chroma axis (U and V are not swapped)",
+          soi::format("U={} V={}", ru, rv));
+
+    {
+        std::lock_guard lk(device->contextMutex());
+        device->context()->Unmap(staging.get(), 0);
+    }
+}
+
+void testGpuPipeline() {
+    section("GPU pipeline (capture -> shader -> encoder, no readback)");
+
+    if (enumerateMonitors().empty()) { info("no monitors; skipped"); return; }
+
+    CaptureConfig cfg;
+    cfg.target       = CaptureTarget::Monitor;
+    cfg.backend      = CaptureBackend::Dxgi;
+    cfg.monitorIndex = 0;
+    cfg.maxWidth     = 1280;
+    cfg.preferGpu    = true;
+
+    DxgiCapture capture(cfg);
+    if (!capture.start()) {
+        info("Desktop Duplication unavailable here; GPU pipeline skipped");
+        return;
+    }
+
+    auto device = capture.gpuDevice();
+    check(device != nullptr,
+          "the DXGI backend keeps frames on the GPU when asked",
+          device ? device->describe() : "no GPU device");
+    if (!device) { capture.stop(); return; }
+
+    // A GPU frame is a texture and nothing else: `data` being null is the
+    // property the whole pipeline depends on, so assert it rather than assume.
+    const Frame* f = nullptr;
+    for (int i = 0; i < 200 && !f; ++i) {
+        f = capture.capture();
+        if (f && !f->gpuTexture) f = nullptr;
+        if (!f) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    check(f != nullptr, "produces a GPU frame");
+    if (!f) { capture.stop(); return; }
+
+    check(f->data == nullptr && f->gpuTexture != nullptr,
+          "the frame is a texture, with no CPU copy taken",
+          soi::format("{}x{}", f->width, f->height));
+
+    // --- and now the encoder, on that same device --------------------------
+    EncoderConfig ecfg;
+    ecfg.width = capture.width() & ~1;
+    ecfg.height = capture.height() & ~1;
+    ecfg.fps = 30;
+    ecfg.bitrateKbps = 3000;
+    ecfg.gopSeconds = 2;
+
+    std::mutex mtx;
+    int    frames = 0, keyframes = 0;
+    size_t bytes  = 0;
+    bool   annexB = true;
+
+    H264Encoder encoder;
+    const bool gpuOffered = encoder.enableGpuInput(device);
+    if (!gpuOffered) {
+        info("this machine's H.264 MFT does not take D3D11 input; GPU encode skipped");
+        capture.stop();
+        return;
+    }
+
+    const bool started = encoder.start(ecfg,
+        [&](const uint8_t* nal, size_t len, bool key, int64_t) {
+            std::lock_guard lk(mtx);
+            ++frames;
+            bytes += len;
+            if (key) ++keyframes;
+            if (len < 4 || nal[0] != 0 || nal[1] != 0 ||
+                !((nal[2] == 1) || (nal[2] == 0 && nal[3] == 1)))
+                annexB = false;
+        });
+
+    check(started, "starts an encoder on the capture's own device");
+    if (!started) { capture.stop(); return; }
+
+    check(encoder.usesGpuInput(),
+          "the encoder really took the D3D11 device (zero-copy input)",
+          encoder.describe());
+
+    if (!encoder.usesGpuInput()) { encoder.stop(); capture.stop(); return; }
+
+    encoder.requestKeyframe();
+
+    // Paced rather than blasted: the submit queue drops the oldest when it is
+    // full by design, so a tight loop would measure the drop policy instead of
+    // the pipeline.
+    int submitted = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (submitted < 30 && std::chrono::steady_clock::now() < deadline) {
+        const Frame* g = capture.capture();
+        if (g && g->gpuTexture) {
+            if (encoder.submitTexture(static_cast<ID3D11Texture2D*>(g->gpuTexture),
+                                      static_cast<int64_t>(submitted) * 33'333'333LL))
+                ++submitted;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(33));
+    }
+
+    // The encoder is asynchronous; give the last frames a moment to come back.
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    encoder.stop();
+    capture.stop();
+
+    check(submitted > 0, "textures are accepted by the encoder",
+          soi::format("{} submitted", submitted));
+
+    std::lock_guard lk(mtx);
+    check(frames > 0, "the GPU pipeline produces encoded frames",
+          soi::format("{} frames, {} bytes from {} textures", frames, bytes, submitted));
+    check(keyframes > 0, "including at least one keyframe");
+    check(annexB, "every access unit is Annex-B, exactly as on the CPU path");
+    // A shader writing to the wrong NV12 plane still encodes -- into a few
+    // hundred bytes of flat colour per frame. Real screen content does not
+    // compress anywhere near that far, so a size floor catches it.
+    check(bytes > static_cast<size_t>(frames) * 200,
+          "the bitstream carries real content, not a flat frame",
+          soi::format("{} bytes over {} frames", bytes, frames));
+}
+
 void testEncoder() {
     section("Media Foundation H.264 encoder");
 
@@ -1996,6 +2278,8 @@ int main(int argc, char** argv) {
         testProtectionEffective();
         testProtectionAllModes();
         testEncoder();
+        testGpuConvert();
+        testGpuPipeline();
 
         std::printf("\n\x1b[1m== summary ==\x1b[0m\n");
         std::printf("  \x1b[32m%d passed\x1b[0m", g_pass);

@@ -215,10 +215,18 @@ bool BitBltCapture::retarget(const CaptureConfig& cfg) {
     // Put it back. A failed switch must not cost the viewer the picture they
     // already had -- the far end asked for a different monitor, not for the
     // share to end.
+    //
+    // Then report FAILURE, even though there is a working capture again. The
+    // return value answers "are you on the target I asked for", not "are you
+    // alive": returning the restored start()'s success would tell the factory
+    // the switch worked, so it would never try a backend that could have served
+    // the new target, and the caller would relabel the stream as a screen it is
+    // not showing.
     logE("could not switch capture target; restoring the previous one");
     stop();
     cfg_ = previous;
-    return start();
+    if (!start()) logE("the previous capture target did not come back either");
+    return false;
 }
 
 void BitBltCapture::stop() {

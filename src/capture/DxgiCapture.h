@@ -26,11 +26,14 @@
 //
 #include "capture/FrameBuffer.h"
 #include "capture/FrameSource.h"
+#include "gpu/GpuPipeline.h"
 #include "util/Win.h"
 
 #include <chrono>
 #include <memory>
 #include <vector>
+
+struct ID3D11Texture2D;
 
 namespace soi {
 
@@ -57,6 +60,8 @@ public:
     std::string    describe() const override { return description_; }
     CaptureBackend backend()  const override { return CaptureBackend::Dxgi; }
 
+    std::shared_ptr<GpuDevice> gpuDevice() const override { return gpu_; }
+
 private:
     struct Output;   // one duplicated display; definition is in the .cpp
 
@@ -66,6 +71,12 @@ private:
     bool collectOutputs();                // one Output per display we overlap
     bool openDuplication(Output& out);    // (re)creates the device + duplication
     bool pumpOutput(Output& out, int timeoutMs);   // one AcquireNextFrame cycle
+
+    // Decides whether this target can run the GPU pipeline and, if so, builds
+    // the shared device and the composed BGRA texture. Returns false for every
+    // reason that is not an error -- a second adapter, --cursor, a driver that
+    // will not make the texture -- and the caller carries on with the CPU path.
+    bool setUpGpu();
 
     CaptureConfig cfg_;
     std::string   description_;
@@ -83,6 +94,17 @@ private:
     FrameBuffer desktop_;
     FrameBuffer composed_;
     Frame       frame_{};
+
+    // The GPU pipeline. `gpu_` is non-null only while it is actually running, so
+    // it doubles as the flag: everything downstream tests it rather than a
+    // separate bool that could disagree with reality.
+    //
+    // `gpuDesktop_` is the virtual-desktop-sized BGRA texture each output's
+    // duplication is copied into. Even with one output the copy is needed --
+    // ReleaseFrame invalidates the acquired texture immediately, and it is a
+    // GPU-to-GPU blit, not a bus crossing.
+    std::shared_ptr<GpuDevice> gpu_;
+    ComPtr<ID3D11Texture2D>    gpuDesktop_;
 
     // The cursor is not in the duplicated image, so a cursor move is a content
     // change even when no output reported one.

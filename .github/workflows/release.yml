@@ -1,0 +1,69 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-openssl-x64-windows-static-${{ runner.os }}
+
+      - name: Install OpenSSL via vcpkg
+        run: |
+          vcpkg install openssl:x64-windows-static
+          vcpkg integrate install
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -S . `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="C:\vcpkg\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Prepare release artifacts
+        run: |
+          New-Item -ItemType Directory -Force dist
+          Copy-Item build\Release\soi-share.exe dist\
+          Copy-Item build\Release\viewer.html   dist\
+          Compress-Archive -Path dist\* -DestinationPath soi-share-${{ github.ref_name }}-windows-x64.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "SOI ${{ github.ref_name }}"
+          body: |
+            ## SOI — Serverless P2P Screen Share ${{ github.ref_name }}
+
+            ### What's included
+            - `soi-share.exe` — the sender (statically linked, runs on any Windows 10 2004+ machine with no install)
+            - `viewer.html` — single-file browser receiver
+
+            ### Quick start
+            ```powershell
+            # Extract the zip, then:
+            .\soi-share.exe start --monitor 0
+            # Paste the answer the browser viewer shows back into the terminal:
+            .\soi-share.exe answer SOI1:...
+            ```
+
+            See the README for full usage, TURN/STUN options, and encrypted signalling.
+          files: soi-share-${{ github.ref_name }}-windows-x64.zip
+          draft: false
+          prerelease: false

@@ -20,11 +20,14 @@
 // stops producing frames. See README 1.2 for what none of them can do.
 //
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace soi {
+
+class GpuDevice;
 
 // A captured frame in top-down BGRA8888. `data` points into storage owned by the
 // FrameSource and is valid only until the next capture() call.
@@ -35,6 +38,11 @@ struct Frame {
     int            stride = 0;       // bytes per row
     int64_t        timeNs = 0;       // steady-clock capture time
     bool           duplicate = false; // pixel-identical to the previous frame
+
+    // On the GPU pipeline the pixels never come back to the CPU: `data` is null
+    // and this is a BGRA ID3D11Texture2D on the shared device instead, valid
+    // until the next capture() call. See gpu/GpuPipeline.h.
+    void*          gpuTexture = nullptr;
 };
 
 enum class CaptureTarget { VirtualDesktop, Monitor, Window };
@@ -55,6 +63,13 @@ struct CaptureConfig {
     bool           includeLayered = false;
     int            maxWidth = 1920;          // downscale above this; 0 disables
     bool           detectDuplicates = true;
+
+    // Keep frames on the graphics card all the way to the encoder. Only the DXGI
+    // backend can serve this, and only when nothing needs CPU-visible pixels --
+    // captureCursor forces it off, because compositing the cursor is GDI. A
+    // backend that cannot honour it simply runs the CPU path; the caller finds
+    // out from gpuDevice() rather than being refused.
+    bool           preferGpu = false;
 };
 
 class FrameSource {
@@ -69,7 +84,11 @@ public:
     // code and the viewer all stay exactly as they are; only the pixels change.
     //
     // On failure the previous target is restored, so a bad monitor index leaves
-    // a working stream rather than a dead one.
+    // a working stream rather than a dead one -- and false is STILL returned.
+    // The answer is "am I now on the target you asked for", not "am I alive":
+    // a restored backend that reported success would stop the factory trying a
+    // backend that could have served the new target, and would leave the caller
+    // labelling the stream as a screen it is not showing.
     virtual bool retarget(const CaptureConfig& cfg) = 0;
 
     // Returns nullptr on a recoverable failure (e.g. the target window was
@@ -89,6 +108,11 @@ public:
     // Which API is doing the reading right now. Reported in --status so a black
     // picture can be diagnosed without a debugger.
     virtual CaptureBackend backend() const = 0;
+
+    // Non-null only while this source is actually running the GPU pipeline, in
+    // which case Frame::gpuTexture is live and Frame::data is not. The encoder
+    // must be put on this same device or there is nothing zero-copy about it.
+    virtual std::shared_ptr<GpuDevice> gpuDevice() const { return nullptr; }
 };
 
 // --- Backend naming ---------------------------------------------------------

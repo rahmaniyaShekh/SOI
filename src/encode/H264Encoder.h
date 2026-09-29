@@ -10,6 +10,7 @@
 // hand-rolled MF encoder "works on Intel but hangs on NVIDIA".
 //
 #include "encode/ColorConvert.h"
+#include "gpu/GpuPipeline.h"
 #include "util/Win.h"
 
 #include <atomic>
@@ -24,8 +25,11 @@
 
 struct IMFTransform;
 struct IMFMediaEventGenerator;
+struct IMFDXGIDeviceManager;
 struct ICodecAPI;
 struct IMFSample;
+struct IMFMediaBuffer;
+struct ID3D11Texture2D;
 
 namespace soi {
 
@@ -72,6 +76,20 @@ public:
     H264Encoder(const H264Encoder&) = delete;
     H264Encoder& operator=(const H264Encoder&) = delete;
 
+    // Offer the encoder a D3D11 device to take its input on, instead of system
+    // memory. Call BEFORE start(); it selects the transform in order to ask
+    // whether that transform is D3D11-aware, and the answer decides which
+    // submit() the caller may use.
+    //
+    // Returns false when this machine's encoder cannot take GPU input -- the
+    // Microsoft software MFT never can, and some older hardware ones do not
+    // either. That is not an error, it is the CPU path.
+    bool enableGpuInput(const std::shared_ptr<GpuDevice>& device);
+
+    // True once start() has confirmed the MFT really took the device. Only then
+    // is submitTexture() usable.
+    bool usesGpuInput() const { return gpuInput_; }
+
     bool start(const EncoderConfig& cfg, OutputCallback onOutput);
     void stop();
 
@@ -79,6 +97,14 @@ public:
     // is backed up (queue depth > kMaxQueue) -- dropping is correct here, since
     // a stale screen frame has no value.
     bool submit(const Nv12Buffer& frame, int64_t ptsNs);
+
+    // The zero-copy path: `bgra` stays on the GPU, is converted to NV12 by a
+    // shader on the encoder's own device, and is handed to the MFT as a DXGI
+    // surface. Nothing crosses the bus.
+    //
+    // Only valid when usesGpuInput() is true. Same drop-when-backed-up contract
+    // as submit().
+    bool submitTexture(ID3D11Texture2D* bgra, int64_t ptsNs);
 
     void requestKeyframe();
     void setBitrate(int kbps);
@@ -95,10 +121,13 @@ private:
     static constexpr size_t kMaxQueue = 3;
 
     bool selectTransform();
+    void attachD3dManager();
     bool configureTypes();
     bool configureCodecApi();
     bool beginStreaming();
     void eventLoop();
+    // Shared tail of submit() and submitTexture(): sample, queue, drop policy.
+    bool dispatch(::IMFMediaBuffer* buffer, int64_t ptsNs);
     void pumpFeed();                       // moves queued samples into the MFT
     bool processInputLocked(IMFSample* sample);
     void drainOutputs();                   // sync mode
@@ -110,6 +139,16 @@ private:
     ComPtr<IMFTransform>           mft_;
     ComPtr<IMFMediaEventGenerator> events_;
     ComPtr<ICodecAPI>              codec_;
+
+    // The GPU input path. `gpuDevice_` is shared with the capture side so a
+    // captured texture can be converted and encoded without ever being copied
+    // to system memory; `gpuManager_` is what Media Foundation wants that device
+    // wrapped in.
+    std::shared_ptr<GpuDevice>      gpuDevice_;
+    ComPtr<IMFDXGIDeviceManager>    gpuManager_;
+    Nv12GpuConverter                gpuConverter_;
+    bool                            gpuRequested_ = false;
+    bool                            gpuInput_     = false;
 
     EncoderConfig  cfg_{};
     OutputCallback onOutput_;

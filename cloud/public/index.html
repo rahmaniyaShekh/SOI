@@ -655,24 +655,40 @@ function showQuality(state){
   }
   if(state.level) el.quality.value=state.level;
 
-  // Which screens the sharing PC has. Only worth offering when there is a
-  // choice to make -- a single-monitor machine gets no control at all rather
-  // than a menu with one entry in it.
-  const screens=Array.isArray(state.monitors)?state.monitors:[];
-  el.screenWrap.hidden=screens.length<2;
-  if(screens.length>=2){
-    const want=screens.map(m=>String(m.i)).join(',');
+  // Which screens the sharing PC has, and which one is on show.
+  //
+  // The list arrives empty when the sender is sharing a single window, or was
+  // started with --lock-target. That is not a rendering edge case to paper over
+  // -- it is the sender saying this viewer may see one thing and only that
+  // thing -- so the picker is not drawn at all.
+  const screens=(state.canSwitch!==false&&Array.isArray(state.monitors))?state.monitors:[];
+
+  // Every screen at once is only a distinct choice when there is more than one,
+  // so a single-monitor PC gets no control rather than a menu of one.
+  const choices=screens.length>=2
+    ? [{v:'desktop',t:`All ${screens.length} screens · ${state.desktopW}×${state.desktopH}`}]
+        .concat(screens.map(m=>(
+          {v:String(m.i),t:`Screen ${m.i+1} · ${m.w}×${m.h}${m.primary?' (main)':''}`})))
+    : [];
+
+  el.screenWrap.hidden=!choices.length;
+  if(choices.length){
+    // Rebuilt only when the machine's screens actually change, so a monitor
+    // unplugged mid-session updates the menu and a routine re-announce does not
+    // yank the menu out from under an open dropdown.
+    const want=choices.map(c=>c.v+':'+c.t).join('|');
     if(el.monitor.dataset.ids!==want){
       el.monitor.dataset.ids=want;
       el.monitor.textContent='';
-      for(const m of screens){
+      for(const c of choices){
         const o=document.createElement('option');
-        o.value=String(m.i);
-        o.textContent=`${m.i+1}: ${m.w}×${m.h}${m.primary?' (main)':''}`;
+        o.value=c.v; o.textContent=c.t;
         el.monitor.appendChild(o);
       }
     }
-    if(state.monitor>=0) el.monitor.value=String(state.monitor);
+    el.monitor.title=`This PC has ${screens.length} screens attached`;
+    const now=state.target==='desktop'?'desktop':String(state.monitor);
+    if(choices.some(c=>c.v===now)) el.monitor.value=now;
   }
 }
 
@@ -699,8 +715,11 @@ el.monitor.onchange=()=>{
   // Deliberately NOT remembered: which screen is interesting changes from one
   // session to the next, and silently reopening on screen 3 because that is
   // where the last conversation happened would be surprising.
-  if(sendControl({type:'setMonitor',index:Number(el.monitor.value)}))
-    setLive('switching screen');
+  const v=el.monitor.value;
+  const msg=v==='desktop'
+    ? {type:'setTarget',kind:'desktop'}
+    : {type:'setTarget',kind:'monitor',index:Number(v)};
+  if(sendControl(msg)) setLive(v==='desktop'?'switching to all screens':'switching screen');
 };
 
 // --- the strip (everything that is not video) -------------------------------

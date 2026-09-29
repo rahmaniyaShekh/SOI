@@ -172,6 +172,8 @@ Two commands make the whole thing legible from a terminal:
 ```
 soi-share capture-check     # start every backend against the target, report what works,
                             # time each, and flag any that come back all-black
+soi-share gpu-check         # whether frames can stay on the GPU, and if not, which
+                            # step said no (see §3.2a)
 soi-share status            # among other things, which backend is live right now
 ```
 
@@ -406,6 +408,7 @@ soi-share start ──spawns──► DETACHED daemon (no console, no window)
 ┌──────────────────────────────▼──────────────────────────────────────────┐
 │  VIEWER — viewer/viewer.html, single file, opened from disk (file://)   │
 │  WebCrypto PBKDF2+AES-GCM · DecompressionStream('deflate-raw') · <video>│
+│  Screen picker (any monitor / all screens) · quality · keyframe request │
 │  Live stats: bitrate, fps, resolution, loss, jitter, RTT, decode, path  │
 └─────────────────────────────────────────────────────────────────────────┘
 
@@ -421,7 +424,8 @@ Media is strictly peer-to-peer after connect. No third party sees pixels.
 | `src/capture/BitBltCapture.{h,cpp}` | GDI capture: desktop / monitor / window, cursor, duplicate detection |
 | `src/capture/CaptureProtect.{h,cpp}` | `SetWindowDisplayAffinity` + watchdog + console-window reality check |
 | `src/encode/ColorConvert.{h,cpp}` | BGRA→NV12, BT.709 limited, SSE2 `madd`, box downscale, multithreaded |
-| `src/encode/H264Encoder.{h,cpp}` | Media Foundation **async** hardware MFT driver |
+| `src/encode/H264Encoder.{h,cpp}` | Media Foundation **async** hardware MFT driver, system-memory and DXGI-surface input |
+| `src/gpu/GpuPipeline.{h,cpp}` | Shared D3D11 device + the BGRA→NV12 conversion shader (§3.2a) |
 | `src/net/Streamer.{h,cpp}` | libdatachannel peer, H264 RTP, RTCP parser, AIMD |
 | `src/net/SignalBlob.{h,cpp}` | deflate + AES-256-GCM (CNG) + base64url |
 | `src/util/*` | logging (console + file), COM/GDI RAII, thread pool, `std::format` shim |
@@ -447,6 +451,87 @@ duplicate-frame detection on an otherwise static screen.
 
 **Capture is 1:1 only.** Downscaling moved into the conversion pass — see §3.2 for why.
 
+## 3.1a Choosing what to watch, from the viewer's side
+
+`--monitor N` only decides where the session *starts*. Once connected, the viewer is
+told what screens the sharing PC has and picks between them from their browser — no
+one has to touch the sharing machine, and nothing about the session is renegotiated:
+
+```
+Screen  [ All 3 screens · 5120×1440 ▾ ]
+        [ Screen 1 · 1920×1200 (main) ]
+        [ Screen 2 · 2560×1440        ]
+        [ Screen 3 · 1920×1080        ]
+```
+
+**"All screens" is the virtual desktop** — the bounding box of every monitor, captured as
+one wide picture. DXGI duplicates each output and composes them; on a machine where
+duplication is refused, WGC cannot address more than one display and the factory falls
+through to GDI, which reads the whole virtual screen in one blit.
+
+The sender enumerates monitors **fresh on every announcement**, so a screen unplugged
+mid-session disappears from the menu rather than becoming a dead entry. The announcement
+is also the single source of truth: the viewer never assumes a switch worked, so a request
+the sender refuses simply snaps the menu back to what is really on screen.
+
+A switch costs a capture retarget and an encoder rebuild — resolution is baked into the
+encoder's media type — so it runs on the capture thread, the same path a quality change
+takes, and is rate-limited to one per 750 ms. Requests arriving faster collapse into the
+latest one rather than queueing: two quick clicks land on the second screen, and a viewer
+holding the menu open cannot make the sender rebuild its encoder in a loop.
+
+One consequence worth stating, because getting it wrong produces a frozen picture rather
+than an error: `profile-level-id` is negotiated **once**, at handshake time, but the
+viewer can switch afterwards to a screen — or to all of them — larger than the one the
+session started on. So the SDP advertises the largest size this session could *ever*
+encode, the virtual desktop included, not the size it opens with.
+
+### Windows virtual desktops (Task View) are not capture targets
+
+`Win+Ctrl+D` desktops are not separate things to capture: they are the same monitors
+showing different windows. Capturing monitor 0 shows whichever virtual desktop is
+currently active, and follows the user when they switch. "Virtual desktop" in this
+document always means the multi-monitor bounding box.
+
+A *separate desktop object* — the secure desktop, or one created by a sandbox — is a
+different matter entirely, and is a hard Windows boundary. See §1.2a.
+
+### What the viewer is allowed to change
+
+Letting the far end choose the screen means the far end can now influence **what is
+shared**, not merely how it looks, so the scope is fixed before the peer exists:
+
+| Started with | Viewer may switch? | What the viewer is told |
+|---|---|---|
+| `--monitor N` or `--desktop` | any screen, or all of them | the full screen list |
+| `--monitor N --lock-target` | no | nothing beyond the current size |
+| `--window <spec>` | **no, unconditionally** | nothing beyond the current size |
+
+A window share is locked whether or not `--lock-target` is given. Sharing one window is an
+explicit narrowing — the operator picked that window and nothing else — and widening it to
+a whole screen on the strength of a message from the far end would hand over more than was
+agreed to.
+
+**The screen list is withheld, not merely ignored.** A locked sender sends an empty list,
+so a viewer who was given one window never learns how many monitors this PC has or how big
+they are. Refusing the request on arrival while still publishing the inventory would leak
+exactly the thing the lock exists to protect.
+
+Three checks, each somewhere the far end cannot reach:
+
+* `Streamer.cpp` bounds the index so a nonsense value never reaches the enumeration code. It decides nothing else.
+* Permission is decided **once**, at `QualityDirector` construction, from the operator's own command line, and held in a `const` member — no later code path can talk itself into flipping it.
+* The request is re-checked on the capture thread against a monitor list read a moment ago, so an index that stopped existing is ignored rather than acted on.
+
+A refused, stale or impossible request re-announces the true state and keeps streaming. A
+target that fails to open restores the previous one — the viewer asked for a different
+screen, not for the share to end.
+
+None of this touches capture protection: `SetWindowDisplayAffinity` is enforced by DWM at
+composition time and the watchdog runs for the life of the process, independent of what is
+being captured. A protected window stays absent from every screen in the picker, including
+"all screens". The test suite proves this against all four capture paths (§1.2).
+
 ## 3.2 Colour conversion and scaling
 
 * **BT.709, limited range (16–235)** — the correct matrix for HD. Using BT.601 here is the single most common cause of "the colours look slightly washed out" in homegrown screen sharers.
@@ -463,6 +548,110 @@ there is nearly free, and it beats HALFTONE's approximation on text.
 Each output pixel box-averages its source footprint; per-pixel channel sums are computed
 once for both rows of an output row pair, then Y is derived per row and UV by combining the
 2×2 block — so every source pixel is read exactly once.
+
+## 3.2a The GPU pipeline — never bringing the frame back
+
+Everything in §3.2 describes work done on the CPU, on pixels that were dragged off
+the graphics card to get there. For a screen share that round trip is pure loss: the
+frame is *born* on the GPU (Desktop Duplication reads the scanout image) and *dies* on
+the GPU (the hardware encoder is on the same chip). At 1920×1200 the CPU path costs, per
+frame:
+
+| Step | Cost |
+|---|---|
+| `CopyResource` to a staging texture | GPU-side |
+| `Map` + read back | **~9.2 MB across the bus** |
+| BGRA→NV12 + downscale, SSE2 × 8 threads | ~0.5–2 ms of CPU |
+| hand ~3.5 MB of system memory to the MFT | **uploaded to the GPU again** |
+
+`--gpu` removes all four. Each output's duplication texture is blitted into one
+BGRA texture with `CopySubresourceRegion`, a pixel shader converts that to NV12,
+and the NV12 texture goes to Media Foundation as a DXGI surface. Nothing is ever
+mapped; the only thing crossing the bus is the compressed bitstream.
+
+```
+soi-share gpu-check
+
+  target      yes -- a screen, which Desktop Duplication can read
+  capture     yes -- Intel(R) UHD Graphics
+  encoder     yes -- Intel® Quick Sync Video H.264 Encoder MFT (hardware)
+  shader      yes -- BGRA to NV12 at 1920x1200
+
+Result: the GPU pipeline.
+```
+
+### How the shader writes NV12
+
+NV12 is planar, and a pixel shader writes to render targets, so the trick is to
+put **two render target views on one NV12 texture**: `R8_UNORM` addresses the Y
+plane at full size, `R8G8_UNORM` addresses the interleaved UV plane at half. Two
+draws of a single fullscreen triangle — built from `SV_VertexID`, so there is no
+vertex buffer, no index buffer and no input layout — and the texture is complete.
+
+The colour maths is the same BT.709 limited-range matrix as §3.2, and **the
+downscale is the same box filter**, not a bilinear tap. That matters for the same
+reason it did on the CPU: one tap reads two of the nine pixels a 3× downscale
+covers, and the seven it skips are the ones that made the text legible.
+
+### What it gives up, and why there are three modes
+
+The frame is no longer visible to the CPU. Two things depended on that:
+
+* **Cursor compositing is GDI**, drawing onto CPU pixels that no longer exist. `--cursor` therefore selects the CPU pipeline, and says so.
+* **Duplicate detection was a sampled hash.** No loss here — duplication already reports content change exactly and for free (§3.4), which is both cheaper and more accurate than hashing.
+
+It also needs one D3D11 device shared by capture and encoder, so **every output
+must be on one adapter** (spanning two would need a cross-adapter copy costing
+about what the readback costs) and **the encoder MFT must be D3D11-aware** — the
+Microsoft software MFT is not.
+
+None of that is reliably knowable in advance, which is why the mode is explicit:
+
+| Flag | Behaviour |
+|---|---|
+| `--pipeline auto` *(default)* | GPU where every precondition holds, CPU otherwise, silently |
+| `--gpu` | GPU or **refuse to start**. For when "it fell back and I did not notice" is the bug |
+| `--cpu` | always SSE2. Required by `--cursor`, and the way to prove a GPU-path bug is a GPU-path bug |
+
+`soi-share gpu-check` reports which one you get by *doing* each step — starting
+the capture, sharing the device, asking the encoder whether it will take it —
+rather than inferring it from a driver version.
+
+### It is verified numerically, not by eye
+
+A shader that writes Y into the UV view, or uses BT.601, or gets the limited-range
+scaling wrong, still encodes to a plausible number of bytes. It just looks wrong,
+and nothing but a human would notice. So the suite reads the NV12 back (test only
+— the real path never does) and checks it against the same reference values the
+SSE2 path is held to:
+
+```
+PASS  the shader converts a BGRA texture to NV12
+PASS  luma matches the BT.709 limited-range reference
+        black 16(want 16) white 235(want 235) grey 126(want 126) red 63(want 63)
+PASS  grey is exactly neutral chroma, so the UV plane is addressed correctly
+PASS  red lands on the right chroma axis (U and V are not swapped)
+```
+
+and then drives the whole thing for real — duplicate the actual screen, convert
+with the actual shader, feed the actual hardware encoder:
+
+```
+PASS  the DXGI backend keeps frames on the GPU when asked
+PASS  the frame is a texture, with no CPU copy taken
+PASS  the encoder really took the D3D11 device (zero-copy input)
+PASS  the GPU pipeline produces encoded frames
+PASS  the bitstream carries real content, not a flat frame
+```
+
+### Where the idea came from
+
+[RustFrame](https://github.com/salihcantekin/RustFrame) mirrors a screen region by
+taking the WGC texture, cropping it in an HLSL shader and presenting it to a
+DirectX swapchain — the frame never touches the CPU. The principle ports directly;
+only the destination differs. RustFrame's is a window, so its shader presents.
+Ours is an encoder, so the shader writes NV12 and the texture goes to Media
+Foundation instead.
 
 ## 3.3 Encoding
 
@@ -576,7 +765,18 @@ soi-share start --monitor 0 --pass "correct-horse-battery-staple"
 # Same LAN, zero external contact of any kind
 soi-share start --monitor 0 --no-stun
 
-# A single window, with the cursor
+# Every screen at once, as one wide picture
+soi-share start --desktop
+
+# Start on monitor 0, but let the viewer switch screens from their browser.
+# This is the default -- the picker appears by itself on a multi-monitor PC.
+soi-share start --monitor 0
+
+# Monitor 1 and nothing else, whatever the viewer asks for
+soi-share start --monitor 1 --lock-target
+
+# A single window, with the cursor. Always locked: the viewer cannot widen
+# this to a screen, and is not told what screens exist.
 soi-share start --window "Visual Studio Code" --cursor
 
 # Foreground, for debugging
@@ -598,6 +798,8 @@ soi-share list-windows
 | `--gop S` | 10 | Keyframe interval, seconds |
 | `--cursor` | off | Composite the mouse cursor |
 | `--layered` | off | Include layered windows (CAPTUREBLT) |
+| `--gpu` / `--cpu` / `--pipeline <mode>` | auto | Keep frames on the graphics card, or force the SSE2 path. See §3.2a |
+| `--lock-target` | off | Pin the share to the named target. No screen picker, and the screen list is not sent. Implied by `--window` |
 | `--protect` / `--no-protect` | on | `WDA_EXCLUDEFROMCAPTURE` + watchdog |
 | `--pass <s>` | none | Encrypt signalling blobs |
 | `--stun <url>` | Cloudflare + Google | STUN; repeatable. First use replaces defaults |
@@ -624,10 +826,14 @@ soi-share list-windows
 | BitBlt capture | enumerates monitors/windows; frames non-uniform; **16.63 ms/frame at 1920×1200, refresh-rate-bound** (16.58 ms with CAPTUREBLT — free, within noise) |
 | Capture backends | all three (DXGI, WGC, GDI) start, produce non-black frames and honour `--max-width`; **DXGI ~2300× cheaper per idle grab than GDI**; the factory prefers DXGI for monitors and refuses to route a window to it; WGC captures a DirectComposition window GDI renders black |
 | Overlays | a layered, topmost overlay window is captured by DXGI, WGC, GDI+CAPTUREBLT and the automatic path — proven by pixel count, no `--layered` flag needed on the default path |
+| Switching target | a retarget to a monitor that does not exist **reports failure and leaves a live capture at the previous size**; retargets to every screen at once and gets real content from it |
 | Capture protection | **117600 probe pixels → 0 via BitBlt, PrintWindow, DXGI Desktop Duplication AND Windows.Graphics.Capture** — all four user-mode paths; reappears when cleared; watchdog re-protects new windows |
 | H.264 encoder | Intel Quick Sync hardware MFT; 60/60 frames at paced 30fps in 2.00 s; Annex-B; SPS on every keyframe; CBR ~4241 kbps vs 3000 target on synthetic noise; 200-frame burst correctly dropped |
 
-**154 assertions pass, 0 fail.**
+| GPU colour conversion | shader output read back and checked against the BT.709 reference: **black→16, white→235, grey→126, red→63**; grey is exactly neutral chroma; U and V are not swapped |
+| GPU pipeline | capture→shader→hardware encoder end to end: the frame is a texture with no CPU copy taken, the MFT really accepts the D3D11 device, and the bitstream carries real content |
+
+**171 assertions pass, 0 fail.**
 
 ### Interop: C++ sender ↔ browser viewer
 
