@@ -28,6 +28,7 @@
 #include "util/Win.h"
 
 #include <windows.h>
+#include <conio.h>
 #include <mfapi.h>
 #include <shellapi.h>
 // gpu-check builds a converter to prove the shader path really works, and its
@@ -671,6 +672,19 @@ bool readFileText(const std::string& path, std::string& out) {
     DWORD got = 0;
     while (ReadFile(h, buf, sizeof buf, &got, nullptr) && got > 0) out.append(buf, got);
     CloseHandle(h);
+    return !out.empty();
+}
+
+// Must match the RCDATA id CMakeLists.txt writes into viewer.rc.
+constexpr int kViewerResourceId = 101;
+
+bool embeddedViewer(std::string& out) {
+    HRSRC res = FindResourceW(nullptr, MAKEINTRESOURCEW(kViewerResourceId), RT_RCDATA);
+    if (!res) return false;
+    HGLOBAL mem = LoadResource(nullptr, res);
+    const void* data = mem ? LockResource(mem) : nullptr;
+    if (!data) return false;
+    out.assign(static_cast<const char*>(data), SizeofResource(nullptr, res));
     return !out.empty();
 }
 
@@ -1405,7 +1419,8 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
     removeStateFile("urls.txt");
     if (opt.http) {
         std::string viewerHtml;
-        if (readFileText(exeDirectory() + "\\viewer.html", viewerHtml)) {
+        if (readFileText(exeDirectory() + "\\viewer.html", viewerHtml) ||
+            embeddedViewer(viewerHtml)) {
             const bool up = handover.start(
                 opt.httpPort, viewerHtml, blob,
                 [](const std::string& answer) {
@@ -1424,7 +1439,8 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
                      "and pasting the answer");
             }
         } else {
-            logW("viewer.html not found next to the executable; handover disabled");
+            logW("no viewer page available (none next to the exe, none embedded); "
+                 "handover disabled");
         }
     }
 
@@ -1769,11 +1785,48 @@ int runSession(const Options& opt, bool daemon) {
 // Subcommands
 // ---------------------------------------------------------------------------
 
+// The join instructions, printed identically by every command that shows them,
+// so the code looks the same whether it came from a fresh start or a repeat one.
+// Returns false when there is no share code (the --no-code route).
+bool printJoinInfo() {
+    // code.txt, not machine.code: it exists only once the code is actually
+    // published, so a code that nobody can join with is never shown.
+    std::string code, service;
+    if (!readStateFile("code.txt", code) || code.empty()) return false;
+
+    readStateFile("service.txt", service);
+    if (service.empty()) service = "https://share.mdarif.online";
+    std::string host = service;
+    if (host.rfind("https://", 0) == 0) host.erase(0, 8);
+    else if (host.rfind("http://", 0) == 0) host.erase(0, 7);
+
+    std::printf("\n  Your friend opens   %s\n", host.c_str());
+    std::printf("  and enters\n\n");
+    std::printf(enableAnsi() ? "      \x1b[1;97m%s\x1b[0m\n\n" : "      %s\n\n", code.c_str());
+    const bool copied = copyToClipboard(code);
+    std::printf("  The screen appears as soon as they type it. Any network --\n"
+                "  they do not have to be on your Wi-Fi. The code belongs to this\n"
+                "  PC and stays the same next time.%s\n",
+                copied ? " (copied to your clipboard)" : "");
+
+    std::string urls;
+    readStateFile("urls.txt", urls);
+    const std::string first = urls.substr(0, urls.find('\n'));
+    if (!first.empty())
+        std::printf("\n  On this Wi-Fi they can also just open  %s\n", first.c_str());
+    return true;
+}
+
+void printControlHint() {
+    std::printf("\n  status: soi-share status      stop: soi-share stop\n");
+}
+
 int cmdStart(int argc, char** argv) {
-    if (daemonRunning()) {
-        std::printf("soi-share is already running. Use 'soi-share status', or "
-                    "'soi-share stop' first.\n");
-        return 1;
+    if (unsigned long pid = 0; daemonRunning(&pid)) {
+        std::printf("soi-share is already running in the background (pid %lu).\n", pid);
+        if (!printJoinInfo()) std::printf("  reprint the offer with: soi-share offer\n");
+        printControlHint();
+        return 0;
     }
 
     Options opt;
@@ -1791,8 +1844,12 @@ int cmdStart(int argc, char** argv) {
     std::printf("soi-share started (pid %lu), detached.\n", pid);
     std::printf("log: %s\n", stateFilePath("soi.log").c_str());
 
+    // Long enough to cover publishOffer's own retries on a slow network, so a
+    // start that will succeed always ends with the code on screen.
+    std::printf("getting a share code...\n");
+    std::fflush(stdout);
     DaemonState reached = DaemonState::NotRunning;
-    if (!waitForState({DaemonState::AwaitingAnswer}, 25000, &reached)) {
+    if (!waitForState({DaemonState::AwaitingAnswer}, 60000, &reached)) {
         std::printf("\nthe daemon did not produce an offer (state: %s).\n"
                     "see the log for why.\n", describeState(reached).c_str());
         return 1;
@@ -1804,50 +1861,9 @@ int cmdStart(int argc, char** argv) {
         return 1;
     }
 
-    // The share code is the headline: one thing to say out loud.
-    std::string code, service;
-    readStateFile("code.txt", code);
-    readStateFile("service.txt", service);
-    if (service.empty()) service = "https://share.mdarif.online";
-
-    // The code is the whole interface. Anything printed near it competes with
-    // it, so the long fallback blob is now behind --no-code rather than being
-    // dumped under every single start.
-    if (!code.empty()) {
-        std::string host = service;
-        if (host.rfind("https://", 0) == 0) host.erase(0, 8);
-        else if (host.rfind("http://", 0) == 0) host.erase(0, 7);
-
-        std::printf("\n  Your friend opens   %s\n", host.c_str());
-        std::printf("  and enters\n\n");
-        std::printf(enableAnsi() ? "      \x1b[1;97m%s\x1b[0m\n\n" : "      %s\n\n",
-                    code.c_str());
-        copyToClipboard(code);
-        std::printf("  The screen appears as soon as they type it. Any network --\n"
-                    "  they do not have to be on your Wi-Fi. The code belongs to this\n"
-                    "  PC and stays the same next time. (copied to your clipboard)\n");
-    }
-
-    std::string urls;
-    readStateFile("urls.txt", urls);
-
-    if (!urls.empty()) {
-        std::string first;
-        size_t pos = 0;
-        while (pos < urls.size()) {
-            size_t nl = urls.find('\n', pos);
-            if (nl == std::string::npos) nl = urls.size();
-            const std::string url = urls.substr(pos, nl - pos);
-            if (!url.empty() && first.empty()) first = url;
-            pos = nl + 1;
-        }
-        if (!first.empty())
-            std::printf("\n  On this Wi-Fi they can also just open  %s\n", first.c_str());
-    }
-
-    // Only when there is no short code to say out loud. Eight hundred characters
-    // of base64 is not something to print by default.
-    if (code.empty()) {
+    // The code is the whole interface. The long fallback blob is printed only
+    // when there is no short code to say out loud (--no-code).
+    if (!printJoinInfo()) {
         std::printf("\n  Send your friend viewer.html once, then this offer:\n\n%s\n\n"
                     "  and run:  soi-share answer <what-they-send-back>\n",
                     blob.c_str());
@@ -1871,7 +1887,7 @@ int cmdStart(int argc, char** argv) {
         std::printf("  (viewer also opened locally, as requested)\n");
     }
 
-    std::printf("\n  status: soi-share status      stop: soi-share stop\n");
+    printControlHint();
     return 0;
 }
 
@@ -1909,6 +1925,9 @@ int cmdStatus() {
 
     const DaemonState state = currentDaemonState();
     std::printf("soi-share: %s (pid %lu)\n", describeState(state).c_str(), pid);
+
+    if (std::string code; readStateFile("code.txt", code) && !code.empty())
+        std::printf("  code: %s\n", code.c_str());
 
     std::string stats;
     if (state == DaemonState::Streaming && readStateFile("stats.txt", stats) &&
@@ -2020,7 +2039,21 @@ int main(int argc, char** argv) {
     const std::string cmd = argc > 1 ? argv[1] : "";
     int rc = 0;
 
-    if (cmd.empty() || cmd == "--help" || cmd == "-h" || cmd == "help") {
+    // Double-clicked in Explorer: the console was created for this process alone.
+    // Treat that as `start`, and hold the window open so the code can be read --
+    // otherwise it would flash up and vanish. The share keeps running after the
+    // window closes.
+    DWORD consolePids[2] = {};
+    const bool ownConsole = GetConsoleProcessList(consolePids, 2) == 1;
+
+    if (cmd.empty() && ownConsole) {
+        rc = cmdStart(argc, argv);
+        std::printf("\n  Sharing continues in the background after this window closes.\n"
+                    "  Press any key to close...");
+        std::fflush(stdout);
+        FlushConsoleInputBuffer(GetStdHandle(STD_INPUT_HANDLE));
+        _getch();
+    } else if (cmd.empty() || cmd == "--help" || cmd == "-h" || cmd == "help") {
         printUsage();
     } else if (cmd == "--daemon") {
         rc = runDaemon(argc, argv);

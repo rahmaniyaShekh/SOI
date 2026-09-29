@@ -188,10 +188,20 @@ if(SOI_BUILD_APP)
     )
     FetchContent_MakeAvailable(libdatachannel)
 
+    # viewer.html is compiled into the exe as RCDATA 101 (see embeddedViewer() in
+    # main.cpp), so the exe alone is enough on another machine. A viewer.html
+    # placed next to the exe still takes precedence.
+    set(SOI_VIEWER_RC ${CMAKE_CURRENT_BINARY_DIR}/viewer.rc)
+    file(WRITE ${SOI_VIEWER_RC}
+        "101 RCDATA \"${CMAKE_CURRENT_SOURCE_DIR}/viewer/viewer.html\"\n")
+
     add_executable(soi-share
         src/main.cpp
         src/net/Streamer.cpp
+        ${SOI_VIEWER_RC}
     )
+    set_source_files_properties(${SOI_VIEWER_RC} PROPERTIES
+        OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/viewer/viewer.html)
     target_link_libraries(soi-share PRIVATE
         soi-core
         LibDataChannel::LibDataChannel

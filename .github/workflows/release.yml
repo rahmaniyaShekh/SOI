@@ -6,6 +6,10 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# The default token is read-only; creating a release needs write access.
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-2022
@@ -51,19 +55,22 @@ jobs:
           body: |
             ## SOI — Serverless P2P Screen Share ${{ github.ref_name }}
 
-            ### What's included
-            - `soi-share.exe` — the sender (statically linked, runs on any Windows 10 2004+ machine with no install)
-            - `viewer.html` — single-file browser receiver
+            Download `soi-share.exe`. That single file is all you need: no installer, no
+            runtime, no admin rights. Windows 10 2004 or later.
 
-            ### Quick start
             ```powershell
-            # Extract the zip, then:
-            .\soi-share.exe start --monitor 0
-            # Paste the answer the browser viewer shows back into the terminal:
-            .\soi-share.exe answer SOI1:...
+            .\soi-share.exe start      # runs in the background, prints a 6-character code
+            .\soi-share.exe status     # from any terminal
+            .\soi-share.exe stop       # from any terminal
             ```
 
-            See the README for full usage, TURN/STUN options, and encrypted signalling.
-          files: soi-share-${{ github.ref_name }}-windows-x64.zip
+            Or just double-click `soi-share.exe`: it starts sharing and shows the code.
+
+            Your friend opens https://share.mdarif.online and types the code. It works
+            from any network. The zip also contains `viewer.html` for the offline
+            `--no-code` flow.
+          files: |
+            dist/soi-share.exe
+            soi-share-${{ github.ref_name }}-windows-x64.zip
           draft: false
           prerelease: false

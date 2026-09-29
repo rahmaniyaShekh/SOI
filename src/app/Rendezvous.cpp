@@ -6,6 +6,7 @@
 #include <winhttp.h>
 #include <bcrypt.h>
 
+#include <atomic>
 #include <chrono>
 #include <thread>
 #include <vector>
@@ -82,41 +83,57 @@ struct HttpResponse {
     std::string error;
 };
 
-// The session handle is shared for the life of the process, and that is not a
-// micro-optimisation.
+// Two long-lived sessions, and which one goes first.
 //
-// WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY makes WinHTTP run WPAD proxy discovery --
-// DNS lookups for wpad.<domain>, a DHCP INFORM -- and it caches the result per
-// SESSION. Opening a fresh session per request therefore re-ran that discovery
-// on every single call, including the answer poll that fires every 2 seconds.
-// On a network with no WPAD server it intermittently stalls until the timeout:
-// measured, a publish that should take 300 ms took 15 SECONDS, which is longer
-// than the whole handshake budget and showed up as a slow reconnect.
-//
-// Discovering the proxy once and reusing it removes that entirely.
-HINTERNET sharedSession() {
-    static HINTERNET session = [] {
-        HINTERNET h = WinHttpOpen(L"soi-share/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-        if (!h)   // no auto-proxy support: fall back to the system configuration
-            h = WinHttpOpen(L"soi-share/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-        return h;
-    }();
-    return session;
+// WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY runs WPAD discovery (DNS for wpad.<domain>,
+// a DHCP INFORM) before its first request. On a network with no WPAD server that
+// stalls until WinHTTP gives up: measured, the first publish of every start timed
+// out after 8 s and only the retry got through, so the code took 10-20 s to
+// appear. Most machines have no proxy at all, so requests go DIRECT first -- or
+// through the proxy the user explicitly configured -- and discovery is only the
+// fallback when that route cannot connect. Sessions are kept for the process so
+// discovery, if it is ever needed, runs once and is cached.
+HINTERNET openSession(DWORD access, const wchar_t* proxy = WINHTTP_NO_PROXY_NAME,
+                      const wchar_t* bypass = WINHTTP_NO_PROXY_BYPASS) {
+    return WinHttpOpen(L"soi-share/1.0", access, proxy, bypass, 0);
 }
 
-// One request/response. Deliberately synchronous: this runs during setup, not
-// in the frame path.
-HttpResponse httpRequest(const std::string& baseUrl, const std::string& path,
-                         const char* method, const std::string& body,
-                         int timeoutMs) {
+struct Sessions {
+    HINTERNET primary  = nullptr;   // direct, or the user's explicit proxy
+    HINTERNET fallback = nullptr;   // automatic proxy discovery
+};
+
+const Sessions& sessions() {
+    static const Sessions s = [] {
+        Sessions out;
+        WINHTTP_CURRENT_USER_IE_PROXY_CONFIG ie{};
+        if (WinHttpGetIEProxyConfigForCurrentUser(&ie)) {
+            if (ie.lpszProxy)
+                out.primary = openSession(WINHTTP_ACCESS_TYPE_NAMED_PROXY, ie.lpszProxy,
+                                          ie.lpszProxyBypass ? ie.lpszProxyBypass
+                                                             : WINHTTP_NO_PROXY_BYPASS);
+            for (LPWSTR p : {ie.lpszProxy, ie.lpszProxyBypass, ie.lpszAutoConfigUrl})
+                if (p) GlobalFree(p);
+        }
+        if (!out.primary) out.primary = openSession(WINHTTP_ACCESS_TYPE_NO_PROXY);
+        out.fallback = openSession(WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY);
+        if (!out.fallback) out.fallback = openSession(WINHTTP_ACCESS_TYPE_DEFAULT_PROXY);
+        return out;
+    }();
+    return s;
+}
+
+// Set once the fallback has worked where the primary did not, so later requests
+// stop paying for a route that is known not to connect.
+std::atomic<bool> g_preferFallback{false};
+
+HttpResponse httpRequestOn(HINTERNET session, const std::string& baseUrl,
+                           const std::string& path, const char* method,
+                           const std::string& body, int timeoutMs) {
     HttpResponse out;
 
     const ParsedUrl url = parseUrl(baseUrl, path);
     if (!url.valid) { out.error = "malformed rendezvous URL: " + baseUrl; return out; }
-
-    HINTERNET session = sharedSession();
     if (!session) { out.error = "WinHttpOpen failed"; return out; }
 
     HInternet connect(WinHttpConnect(session, url.host.c_str(), url.port, 0));
@@ -169,6 +186,30 @@ HttpResponse httpRequest(const std::string& baseUrl, const std::string& path,
 
     out.transportOk = true;
     return out;
+}
+
+// One request/response. Deliberately synchronous: this runs during setup, not
+// in the frame path. Every call made through here is idempotent (publish
+// overwrites, polls read, delete deletes), so retrying on the other route is safe.
+HttpResponse httpRequest(const std::string& baseUrl, const std::string& path,
+                         const char* method, const std::string& body,
+                         int timeoutMs) {
+    const Sessions& s = sessions();
+    const bool viaFallback = g_preferFallback.load();
+
+    HttpResponse first = httpRequestOn(viaFallback ? s.fallback : s.primary,
+                                       baseUrl, path, method, body, timeoutMs);
+    if (first.transportOk) return first;
+
+    HINTERNET other = viaFallback ? s.primary : s.fallback;
+    if (!other) return first;
+    HttpResponse second = httpRequestOn(other, baseUrl, path, method, body, timeoutMs);
+    if (!second.transportOk) return first;
+
+    g_preferFallback.store(!viaFallback);
+    logI("rendezvous reachable {}; using that from now on",
+         viaFallback ? "directly" : "only through the system proxy");
+    return second;
 }
 
 // Pulls one string field out of a small, known-shape JSON response. A full

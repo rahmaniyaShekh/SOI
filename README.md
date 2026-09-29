@@ -738,8 +738,13 @@ Output: `build\Release\soi-share.exe` plus `viewer.html`.
 
 **Runs on any laptop with no extra configuration**: the CRT is linked statically
 (`/MT`), OpenSSL is static, and there is no runtime dependency beyond what ships with
-Windows. Copy `soi-share.exe` and `viewer.html` and run — no installer, no redistributable,
-no admin rights, no GPU required (software encoder fallback).
+Windows. `viewer.html` is also compiled into the exe, so **`soi-share.exe` on its own is
+the whole install** — no installer, no redistributable, no admin rights, no GPU required
+(software encoder fallback). A `viewer.html` placed next to the exe overrides the
+embedded copy. Prebuilt binaries are on the GitHub Releases page.
+
+Double-clicking the exe does the same as `soi-share start`: it starts sharing in the
+background, shows the code, and waits for a key press before closing its window.
 
 ### Toolchain notes found the hard way
 
