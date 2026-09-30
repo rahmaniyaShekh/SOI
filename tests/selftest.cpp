@@ -75,6 +75,17 @@ void info(const std::string& text) {
     std::printf("        \x1b[90m%s\x1b[0m\n", text.c_str());
 }
 
+// `unit` mode runs on shared CI machines whose speed says nothing about this
+// code, so a timing budget there is reported rather than enforced. The full
+// suite, run on real hardware, still fails on it.
+bool g_timingIsAdvisory = false;
+
+void checkTiming(bool ok, const std::string& what, const std::string& detail) {
+    if (ok || !g_timingIsAdvisory) { check(ok, what, detail); return; }
+    std::printf("  \x1b[33mSLOW\x1b[0m  %s  -- %s (timing is advisory in unit mode)\n",
+                what.c_str(), detail.c_str());
+}
+
 std::string sampleSdp() {
     // A realistic offer: this is what the compressor and crypto actually see.
     return
@@ -325,7 +336,7 @@ void testColorConvert() {
 
     info(soi::format("1080p 1:1 conversion: {:.2f} ms/frame ({:.0f} fps ceiling)",
                      ms, 1000.0 / ms));
-    check(ms < 8.0, "1080p conversion fits a 30fps budget", soi::format("{:.2f} ms", ms));
+    checkTiming(ms < 8.0, "1080p conversion fits a 30fps budget", soi::format("{:.2f} ms", ms));
 
     // --- downscaling path -----------------------------------------------------
     // This replaced GDI's HALFTONE StretchBlt, which cost ~16 ms/frame.
@@ -390,7 +401,7 @@ void testColorConvert() {
 
     info(soi::format("1920x1200 -> 1280x800 convert+downscale: {:.2f} ms/frame "
                      "(GDI HALFTONE StretchBlt was ~16.7 ms just to scale)", msScaled));
-    check(msScaled < 8.0, "scaled conversion fits a 30fps budget",
+    checkTiming(msScaled < 8.0, "scaled conversion fits a 30fps budget",
           soi::format("{:.2f} ms", msScaled));
 }
 
@@ -2482,6 +2493,7 @@ int main(int argc, char** argv) {
         rc = runCaptureBench();
     } else if (argc > 1 && std::strcmp(argv[1], "unit") == 0) {
         std::printf("\x1b[1msoi-selftest unit\x1b[0m (no screen, GPU or media stack needed)\n");
+        g_timingIsAdvisory = true;
         testBase64();
         testSignalBlob();
         testColorConvert();
