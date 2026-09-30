@@ -1,16 +1,21 @@
 //
 // soi-share -- serverless peer-to-peer screen sharing. Terminal only, no GUI.
 //
-// The streaming process runs DETACHED: `start` spawns it with no console and
-// returns immediately, so closing the launching terminal does not kill it, and
-// `status` / `answer` / `stop` work from any other terminal.
+// The streaming process runs DETACHED: `start` relaunches this exe as
+// `start --foreground --log-file <path>` with no console and returns, so closing
+// the launching terminal does not kill it, and `status` / `answer` / `stop`
+// reach it from any other terminal over a loopback control channel.
 //
 // Session flow (no signalling server anywhere in it):
-//   soi-share start --monitor 0     -> prints the offer blob, opens the viewer
-//   (viewer produces an answer blob)
-//   soi-share answer SOI1:...       -> hands it to the running daemon
+//   soi-share start                 -> prints a 6-character code
+//   (the viewer types it at the code page)
 //   soi-share stop                  -> shuts it down
 //
+// The exe also manages itself: install / update / uninstall (app/Lifecycle.h).
+//
+#include "app/Control.h"
+#include "app/Install.h"
+#include "app/Lifecycle.h"
 #include "app/LocalHandover.h"
 #include "app/Rendezvous.h"
 #include "app/Service.h"
@@ -42,6 +47,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -57,6 +63,12 @@ namespace {
 #endif
 
 std::atomic<bool> g_running{true};
+
+// True for `start --foreground` in a terminal: the join instructions are
+// printed there as well as the log. False for the detached background copy.
+bool g_attached = false;
+
+bool printJoinInfo(const std::map<std::string, std::string>& live);
 
 BOOL WINAPI consoleHandler(DWORD type) {
     if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
@@ -147,23 +159,51 @@ struct Options {
     bool stunOverridden = false;
 
     std::string turnUrl, turnUser, turnPass;
+
+    // Process management, not session settings: stay attached instead of
+    // detaching, and where the instance writes its log.
+    bool        foreground = false;
+    std::string logFile;
 };
 
 void printUsage() {
-    std::puts(R"(soi-share -- serverless P2P screen sharing (BitBlt capture + WebRTC)
+    std::printf("soi-share %s -- serverless P2P screen sharing from the terminal\n", appVersion());
+    std::puts(R"(
+QUICK START
+  soi-share start          start sharing in the background; prints a 6-character
+                           code your friend types at https://share.mdarif.online
+  soi-share status         is it running? pid, uptime, the code, live stats
+  soi-share stop           stop sharing
 
-USAGE
-  soi-share start [options]    start sharing (detached; returns immediately)
-  soi-share answer <blob>      hand the viewer's answer to the running daemon
-  soi-share status             show what the daemon is doing
-  soi-share offer              reprint the current offer blob
-  soi-share stop               stop the daemon (works from any terminal)
-  soi-share run [options]      run in the foreground instead (for debugging)
-  soi-share list-monitors      enumerate monitors
-  soi-share list-windows       enumerate capturable windows
-  soi-share capture-check      try every capture backend and report what works
-  soi-share gpu-check          report whether frames can stay on the GPU, and why not
-  soi-share purge              erase all on-disk state (log, share code, blobs)
+SHARING
+  start [options]          start in the background and return to the prompt
+  start --foreground       stay attached with a live log instead (Ctrl+C stops)
+  status                   pid, uptime, state and code of the running share
+  stop [--force]           stop it; --force ends it if it will not stop
+  answer <blob>            hand a viewer's answer to the running share (--no-code)
+  offer                    reprint the pending offer blob (--no-code)
+  list-monitors            enumerate monitors
+  list-windows             enumerate capturable windows
+
+INSTALL AND UPDATE (per-user; never needs admin)
+  install                  copy this exe to %LOCALAPPDATA%\Programs\soi-share and
+                           add that folder to your PATH
+  update                   download the latest release, verify its SHA-256 and
+                           replace the installed exe; a running share restarts on it
+  update --check           only say whether a newer release exists
+  update --force           reinstall the latest release even if this is current
+  update --forget-token    delete the saved GitHub token
+  uninstall [--purge]      stop, remove from PATH, delete the program folder. Your
+                           share code is kept unless --purge
+  version                  version, and whether this is the installed copy
+  licenses                 third-party license notices
+  help                     this text
+
+DIAGNOSTICS
+  capture-check            try every capture backend and report what works
+  gpu-check                report whether frames can stay on the GPU, and why not
+  run [options]            foreground session that reads the answer from stdin
+  purge                    erase all on-disk state (log, share code, saved token)
 
 CAPTURE TARGET
   --monitor <N>          share monitor N (default: 0)
@@ -265,7 +305,9 @@ MISC
   --no-http              disable the handover page; use the send-a-file flow
   --open-viewer          also open the viewer on THIS machine (off by default)
   --verbose              trace logging
-  --help)");
+  --foreground           (start) stay attached with a live log
+  --log-file <path>      (start) log here instead of
+                         %LOCALAPPDATA%\soi-share\soi-share.log)");
 }
 
 bool parseInt(const char* text, int& out) {
@@ -286,7 +328,13 @@ bool parseOptions(int argc, char** argv, int first, Options& o) {
             return argv[++i];
         };
 
-        if (a == "--daemon")                 { continue; }   // internal marker
+        if (a == "--daemon")                 { continue; }   // 1.0.x marker, ignored
+        else if (a == "--foreground")        { o.foreground = true; }
+        else if (a == "--log-file") {
+            const char* v = next("--log-file");
+            if (!v) return false;
+            o.logFile = v;
+        }
         else if (a == "--desktop")           { o.target = CaptureTarget::VirtualDesktop; }
         else if (a == "--cursor")            { o.cursor = true; }
         else if (a == "--layered")           { o.layered = true; }
@@ -399,11 +447,26 @@ bool parseOptions(int argc, char** argv, int first, Options& o) {
     return true;
 }
 
-// Re-serialises the user's options so the detached child gets exactly them.
-std::vector<std::string> rebuildArgs(int argc, char** argv, int first) {
-    std::vector<std::string> args{"--daemon"};
-    for (int i = first; i < argc; ++i) args.emplace_back(argv[i]);
+// The user's own options, minus the process-management ones, so the detached
+// child gets exactly what was typed -- and cannot be told to detach again.
+std::vector<std::string> sessionArgs(int argc, char** argv, int first) {
+    std::vector<std::string> args;
+    for (int i = first; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--foreground" || a == "--daemon") continue;
+        if (a == "--log-file") { ++i; continue; }
+        args.push_back(a);
+    }
     return args;
+}
+
+std::string joinQuoted(const std::vector<std::string>& args) {
+    std::string out;
+    for (const auto& a : args) {
+        if (!out.empty()) out += ' ';
+        out += toUtf8(quoteArg(a));
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -675,17 +738,8 @@ bool readFileText(const std::string& path, std::string& out) {
     return !out.empty();
 }
 
-// Must match the RCDATA id CMakeLists.txt writes into viewer.rc.
-constexpr int kViewerResourceId = 101;
-
 bool embeddedViewer(std::string& out) {
-    HRSRC res = FindResourceW(nullptr, MAKEINTRESOURCEW(kViewerResourceId), RT_RCDATA);
-    if (!res) return false;
-    HGLOBAL mem = LoadResource(nullptr, res);
-    const void* data = mem ? LockResource(mem) : nullptr;
-    if (!data) return false;
-    out.assign(static_cast<const char*>(data), SizeofResource(nullptr, res));
-    return !out.empty();
+    return loadEmbeddedResource(kViewerResourceId, out);
 }
 
 bool fileExists(const std::string& path) {
@@ -1218,7 +1272,7 @@ void runCaptureLoop(FrameSource& capture, QualityDirector& director, Streamer& s
                 s.rembSeen ? " [remb]" : "");
 
             if (daemon) {
-                writeStateFile("stats.txt", line);
+                setLive("stats", line);
                 logT("{}", line);
             } else {
                 std::printf("\r  %s   ", line.c_str());
@@ -1235,16 +1289,15 @@ void runCaptureLoop(FrameSource& capture, QualityDirector& director, Streamer& s
     logI("streaming stopped");
 }
 
-// Waits for `soi-share answer <blob>` to drop answer.blob into the state dir.
-bool waitForAnswerFile(std::string& blobOut, int timeoutMs) {
+// Waits for an answer delivered by `soi-share answer <blob>` (over the control
+// channel) or by the local handover page.
+bool waitForPushedAnswer(std::string& blobOut, int timeoutMs) {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(timeoutMs);
     for (;;) {
         if (!g_running.load() || stopRequested()) return false;
 
-        std::string blob;
-        if (readStateFile("answer.blob", blob) && !blob.empty()) {
-            removeStateFile("answer.blob");   // one-shot
+        if (std::string blob; takeAnswer(blob)) {
             blobOut = blob;
             return true;
         }
@@ -1393,8 +1446,8 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
             logW("falling back to the manual code route");
             liveCode.clear();
         } else {
-            writeStateFile("code.txt", formatShareCode(shareCode));
-            writeStateFile("service.txt", opt.serviceUrl);
+            setLive("code", formatShareCode(shareCode));
+            setLive("service", opt.serviceUrl);
             // The room carries a 10-minute idle expiry, but polling for the
             // answer refreshes it, so in practice the code is good for as long
             // as this process is running. Saying "valid for 10 minutes" was
@@ -1403,8 +1456,7 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
         }
     }
 
-    writeStateFile("offer.blob", blob);
-    setDaemonState(DaemonState::AwaitingAnswer);
+    setLive("offer", blob);
     // The blob is sealed with the share code in code mode, and only falls back
     // to --pass when there is no code. Reporting on `passphrase` alone used to
     // print "NOT encrypted" for every short-code session, which was alarming
@@ -1416,7 +1468,7 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
 
     // ---- local handover: serve the viewer so the peer only opens a URL ----
     LocalHandover handover;
-    removeStateFile("urls.txt");
+    clearLive("urls");
     if (opt.http) {
         std::string viewerHtml;
         if (readFileText(exeDirectory() + "\\viewer.html", viewerHtml) ||
@@ -1424,15 +1476,16 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
             const bool up = handover.start(
                 opt.httpPort, viewerHtml, blob,
                 [](const std::string& answer) {
-                    // Reuse the same one-shot file the `answer` command writes,
-                    // so both delivery routes converge on one code path.
-                    return writeStateFile("answer.blob", answer);
+                    // The same slot the `answer` command fills, so both
+                    // delivery routes converge on one code path.
+                    pushAnswer(answer);
+                    return true;
                 });
 
             if (up) {
                 std::string list;
-                for (const auto& url : handover.urls()) list += url + "\n";
-                writeStateFile("urls.txt", list);
+                for (const auto& url : handover.urls()) list += (list.empty() ? "" : " ") + url;
+                setLive("urls", list);
                 logI("handover page ready on port {}", handover.port());
             } else {
                 logW("handover page unavailable; fall back to sending viewer.html "
@@ -1441,6 +1494,21 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
         } else {
             logW("no viewer page available (none next to the exe, none embedded); "
                  "handover disabled");
+        }
+    }
+
+    // Only now is everything `start` shows in place: the code, and the LAN
+    // address of the handover page.
+    setDaemonState(DaemonState::AwaitingAnswer);
+    if (g_attached && !liveCode.empty()) {
+        static bool shown = false;   // the code is the same on every reconnect
+        if (!shown) {
+            std::map<std::string, std::string> live;
+            for (const auto& [k, v] : liveSnapshot()) live[k] = v;
+            printJoinInfo(live);
+            std::printf("\n  Ctrl+C stops sharing. Live log:\n\n");
+            std::fflush(stdout);
+            shown = true;
         }
     }
 
@@ -1463,9 +1531,7 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
             else if (askedToStop) logI("stop requested while waiting for someone to join");
 
             // A manual answer may still have been delivered meanwhile.
-            std::string manual;
-            if (readStateFile("answer.blob", manual) && !manual.empty()) {
-                removeStateFile("answer.blob");
+            if (std::string manual; takeAnswer(manual)) {
                 answerBlob = manual;
             } else {
                 // Not the operator stopping us: the rendezvous went wrong, or
@@ -1479,7 +1545,7 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
 
     if (answerBlob.empty() && daemon) {
         // No stdin in detached mode: the answer arrives via `soi-share answer`.
-        if (!waitForAnswerFile(answerBlob, 10 * 60 * 1000)) {
+        if (!waitForPushedAnswer(answerBlob, 10 * 60 * 1000)) {
             // Distinguish a real timeout from an operator-requested stop; the
             // two mean very different things when reading the log afterwards.
             if (stopRequested() || !g_running.load())
@@ -1570,7 +1636,7 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
     director.requestKeyframe();   // the viewer cannot decode until the first IDR
 
     setDaemonState(DaemonState::Streaming);
-    removeStateFile("offer.blob");   // consumed; do not leave it lying around
+    clearLive("offer");   // consumed
 
     // ---- let the viewer come back at any time, without touching this PC ----
     //
@@ -1788,15 +1854,18 @@ int runSession(const Options& opt, bool daemon) {
 // The join instructions, printed identically by every command that shows them,
 // so the code looks the same whether it came from a fresh start or a repeat one.
 // Returns false when there is no share code (the --no-code route).
-bool printJoinInfo() {
-    // code.txt, not machine.code: it exists only once the code is actually
-    // published, so a code that nobody can join with is never shown.
-    std::string code, service;
-    if (!readStateFile("code.txt", code) || code.empty()) return false;
+bool printJoinInfo(const std::map<std::string, std::string>& live) {
+    auto get = [&](const char* key) {
+        const auto it = live.find(key);
+        return it == live.end() ? std::string() : it->second;
+    };
+    // Present only once the code is actually published, so a code that nobody
+    // can join with is never shown.
+    const std::string code = get("code");
+    if (code.empty()) return false;
 
-    readStateFile("service.txt", service);
-    if (service.empty()) service = "https://share.mdarif.online";
-    std::string host = service;
+    std::string host = get("service");
+    if (host.empty()) host = "https://share.mdarif.online";
     if (host.rfind("https://", 0) == 0) host.erase(0, 8);
     else if (host.rfind("http://", 0) == 0) host.erase(0, 7);
 
@@ -1809,61 +1878,174 @@ bool printJoinInfo() {
                 "  PC and stays the same next time.%s\n",
                 copied ? " (copied to your clipboard)" : "");
 
-    std::string urls;
-    readStateFile("urls.txt", urls);
-    const std::string first = urls.substr(0, urls.find('\n'));
+    const std::string urls  = get("urls");
+    const std::string first = urls.substr(0, urls.find(' '));
     if (!first.empty())
         std::printf("\n  On this Wi-Fi they can also just open  %s\n", first.c_str());
     return true;
 }
 
 void printControlHint() {
-    std::printf("\n  status: soi-share status      stop: soi-share stop\n");
+    std::printf("\n  next:  soi-share status     soi-share stop     soi-share help\n");
 }
 
-int cmdStart(int argc, char** argv) {
-    if (unsigned long pid = 0; daemonRunning(&pid)) {
-        std::printf("soi-share is already running in the background (pid %lu).\n", pid);
-        if (!printJoinInfo()) std::printf("  reprint the offer with: soi-share offer\n");
-        printControlHint();
-        return 0;
+std::string describeUptime(long long secs) {
+    if (secs < 60)   return soi::format("{}s", secs);
+    if (secs < 3600) return soi::format("{}m {:02}s", secs / 60, secs % 60);
+    return soi::format("{}h {:02}m", secs / 3600, (secs / 60) % 60);
+}
+
+std::map<std::string, std::string> liveStatus(const InstanceRecord& rec) {
+    std::map<std::string, std::string> reply;
+    if (!controlRequest(rec, "status", reply) || !reply.count("ok")) reply.clear();
+    return reply;
+}
+
+std::string defaultLogPath() { return stateFilePath("soi-share.log"); }
+
+// The end of the log, for when the background copy died before it could say
+// anything over the control channel.
+void printLogTail(const std::string& path, int lines) {
+    std::string text;
+    if (!readFileText(path, text)) {
+        std::printf("  (the log %s is empty)\n", path.c_str());
+        return;
     }
+    size_t pos = text.size();
+    for (int n = 0; n <= lines && pos > 0; ) {
+        pos = text.find_last_of('\n', pos - 1);
+        if (pos == std::string::npos) { pos = 0; break; }
+        ++n;
+    }
+    std::printf("  last lines of %s:\n%s\n", path.c_str(), text.substr(pos).c_str());
+}
 
-    Options opt;
-    if (!parseOptions(argc, argv, 2, opt)) return 2;
+// Prints what to do about an instance that is already there. Returns false if
+// it is not in a state that can be used.
+bool reportExisting(const FoundInstance& found) {
+    const unsigned long pid = found.record.pid;
+    switch (found.state) {
+        case InstanceState::Running: {
+            const auto live = liveStatus(found.record);
+            std::printf("soi-share is already running (pid %lu, up %s). Not starting a second one.\n",
+                        pid, describeUptime(std::atoll(live.count("uptime") ? live.at("uptime").c_str() : "0")).c_str());
+            if (!printJoinInfo(live)) std::printf("  reprint the offer with: soi-share offer\n");
+            printControlHint();
+            return true;
+        }
+        case InstanceState::Unresponsive:
+            std::printf("soi-share (pid %lu) is running but not answering its control channel.\n"
+                        "Run `soi-share stop --force`, then start again.\n", pid);
+            return false;
+        case InstanceState::Legacy:
+            std::printf("An older version of soi-share (pid %lu) is running.\n"
+                        "Run `soi-share stop` first, then start again.\n", pid);
+            return false;
+        case InstanceState::None:
+            break;
+    }
+    return true;
+}
 
-    // Clear stale state before spawning so we never read a previous run's offer.
-    removeStateFile("offer.blob");
-    removeStateFile("answer.blob");
-    removeStateFile("stats.txt");
-    removeStateFile("code.txt");   // display copy only; machine.code persists
-
-    const unsigned long pid = spawnDetached(rebuildArgs(argc, argv, 2));
-    if (!pid) { std::printf("failed to start the background process\n"); return 1; }
-
-    std::printf("soi-share started (pid %lu), detached.\n", pid);
-    std::printf("log: %s\n", stateFilePath("soi.log").c_str());
-
-    // Long enough to cover publishOffer's own retries on a slow network, so a
-    // start that will succeed always ends with the code on screen.
-    std::printf("getting a share code...\n");
-    std::fflush(stdout);
-    DaemonState reached = DaemonState::NotRunning;
-    if (!waitForState({DaemonState::AwaitingAnswer}, 60000, &reached)) {
-        std::printf("\nthe daemon did not produce an offer (state: %s).\n"
-                    "see the log for why.\n", describeState(reached).c_str());
+// The instance itself: `start --foreground`, attached to a terminal or -- as the
+// background copy -- to nothing but its log.
+int runInstance(const Options& opt, const std::vector<std::string>& args) {
+    if (!acquireInstanceLock()) {
+        std::printf("another soi-share is already running or starting; see `soi-share status`\n");
         return 1;
     }
 
-    std::string blob;
-    if (!readStateFile("offer.blob", blob) || blob.empty()) {
-        std::printf("offer file missing\n");
+    const std::string logPath = opt.logFile.empty() ? defaultLogPath() : opt.logFile;
+    logSetFile(logPath, /*truncate=*/true);
+    // Files 1.0.x kept its live state in; that state lives in memory now.
+    for (const char* stale : {"soi.log", "status.txt", "code.txt", "service.txt", "urls.txt",
+                              "stats.txt", "offer.blob", "answer.blob"})
+        removeStateFile(stale);
+
+    createStopEvent();
+    setLive("args", joinQuoted(args));
+    setLive("log", logPath);
+    setDaemonState(DaemonState::Starting);
+    g_attached = GetConsoleWindow() != nullptr;
+    logSetVerbose(opt.verbose);
+
+    std::string error;
+    if (!startControlServer(appVersion(), error)) {
+        logE("cannot open the control channel: {}", error);
+        closeStopEvent();
+        return 1;
+    }
+    logI("--- soi-share {} starting (pid {}, {}) ---", appVersion(), GetCurrentProcessId(),
+         g_attached ? "in a terminal" : "no console");
+
+    const int rc = runSession(opt, true);
+
+    setDaemonState(DaemonState::NotRunning);
+    stopControlServer();
+    logI("--- soi-share exiting (rc {}) ---", rc);
+    closeStopEvent();
+    return rc;
+}
+
+int cmdStart(int argc, char** argv) {
+    const FoundInstance found = findInstance();
+    if (found.cleanedStale)
+        std::printf("(removed a stale record left by an earlier run that did not exit cleanly)\n");
+    if (found.state != InstanceState::None) return reportExisting(found) ? 0 : 1;
+
+    // Parsed here as well as in the child, so a typo is reported in THIS
+    // terminal instead of in a log nobody is looking at.
+    Options opt;
+    if (!parseOptions(argc, argv, 2, opt)) {
+        std::printf("see `soi-share help` for the options\n");
+        return 2;
+    }
+    const std::vector<std::string> args = sessionArgs(argc, argv, 2);
+    if (opt.foreground) return runInstance(opt, args);
+
+    const std::string logPath = opt.logFile.empty() ? defaultLogPath() : opt.logFile;
+    std::vector<std::string> childArgs{"start", "--foreground", "--log-file", logPath};
+    childArgs.insert(childArgs.end(), args.begin(), args.end());
+
+    const unsigned long pid = spawnDetached(childArgs);
+    if (!pid) {
+        std::printf("could not start the background process; try `soi-share start --foreground` "
+                    "to see why\n");
+        return 1;
+    }
+    std::printf("soi-share started in the background (pid %lu)\n", pid);
+    std::printf("getting a share code...\n");
+    std::fflush(stdout);
+
+    // Long enough to cover publishOffer's own retries on a slow network, so a
+    // start that will succeed always ends with the code on screen.
+    std::map<std::string, std::string> live;
+    const auto deadline = std::chrono::steady_clock::now() + 60s;
+    bool ready = false, died = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!processAlive(pid)) { died = true; break; }
+        const FoundInstance now = findInstance();
+        if (now.state == InstanceState::Running && now.record.pid == pid) {
+            live = liveStatus(now.record);
+            const DaemonState st = stateFromToken(live.count("state") ? live["state"] : "");
+            if (st == DaemonState::AwaitingAnswer || st == DaemonState::Connecting ||
+                st == DaemonState::Streaming) { ready = true; break; }
+        }
+        std::this_thread::sleep_for(150ms);
+    }
+
+    if (!ready) {
+        std::printf(died ? "\nsoi-share stopped before it produced a share code.\n"
+                         : "\nsoi-share has not produced a share code after 60 s "
+                           "(it is still trying; `soi-share status` shows how far it got).\n");
+        printLogTail(logPath, 12);
         return 1;
     }
 
     // The code is the whole interface. The long fallback blob is printed only
     // when there is no short code to say out loud (--no-code).
-    if (!printJoinInfo()) {
+    const std::string blob = live.count("offer") ? live["offer"] : "";
+    if (!printJoinInfo(live)) {
         std::printf("\n  Send your friend viewer.html once, then this offer:\n\n%s\n\n"
                     "  and run:  soi-share answer <what-they-send-back>\n",
                     blob.c_str());
@@ -1880,108 +2062,141 @@ int cmdStart(int argc, char** argv) {
     // Opening a browser here would put a window on the very screen being shared,
     // so it is strictly opt-in.
     const std::string viewerPath = exeDirectory() + "\\viewer.html";
-    if (opt.openViewer && fileExists(viewerPath)) {
+    if (opt.openViewer && fileExists(viewerPath) && !blob.empty()) {
         ShellExecuteW(nullptr, L"open",
                       toUtf16(buildViewerUrl(viewerPath, blob)).c_str(),
                       nullptr, nullptr, SW_SHOWNORMAL);
         std::printf("  (viewer also opened locally, as requested)\n");
     }
 
+    std::printf("\n  log: %s\n", logPath.c_str());
     printControlHint();
     return 0;
 }
 
-int cmdAnswer(int argc, char** argv) {
-    if (!daemonRunning()) {
-        std::printf("soi-share is not running. Start it with 'soi-share start'.\n");
-        return 1;
+// For the commands that need a running share: finds it, or says why not.
+bool requireRunning(FoundInstance& found) {
+    found = findInstance();
+    if (found.cleanedStale)
+        std::printf("(removed a stale record left by an earlier run that did not exit cleanly)\n");
+    switch (found.state) {
+        case InstanceState::Running: return true;
+        case InstanceState::None:
+            std::printf("soi-share is not running. Start it with `soi-share start`.\n");
+            return false;
+        case InstanceState::Unresponsive:
+            std::printf("soi-share (pid %lu) is running but not answering its control channel.\n"
+                        "Run `soi-share stop --force`, then `soi-share start`.\n", found.record.pid);
+            return false;
+        case InstanceState::Legacy:
+            std::printf("An older version of soi-share (pid %lu) is running and cannot be asked\n"
+                        "for details. Run `soi-share stop`, then `soi-share start`.\n",
+                        found.record.pid);
+            return false;
     }
+    return false;
+}
+
+int cmdAnswer(int argc, char** argv) {
     if (argc < 3) { std::printf("usage: soi-share answer <blob>\n"); return 2; }
+    FoundInstance found;
+    if (!requireRunning(found)) return 1;
 
     // Accept the blob as one argument, or as the remaining words joined: a blob
     // is a single token, but shells and copy-paste vary.
     std::string blob;
     for (int i = 2; i < argc; ++i) blob += argv[i];
 
-    if (!writeStateFile("answer.blob", blob)) {
-        std::printf("could not hand the answer to the daemon\n");
+    std::map<std::string, std::string> reply;
+    if (!controlRequest(found.record, "answer " + blob, reply) || !reply.count("ok")) {
+        std::printf("could not hand the answer to soi-share (pid %lu)\n", found.record.pid);
         return 1;
     }
     std::printf("answer delivered, connecting...\n");
 
-    DaemonState reached = DaemonState::NotRunning;
-    if (waitForState({DaemonState::Streaming}, 45000, &reached)) {
-        std::printf("connected -- streaming.\n");
-        return 0;
+    const auto deadline = std::chrono::steady_clock::now() + 45s;
+    std::string state;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto live = liveStatus(found.record);
+        if (live.empty()) break;
+        state = live.at("state");
+        if (stateFromToken(state) == DaemonState::Streaming) {
+            std::printf("connected -- streaming.\n");
+            return 0;
+        }
+        std::this_thread::sleep_for(250ms);
     }
-    std::printf("did not reach streaming (state: %s). See %s\n",
-                describeState(reached).c_str(), stateFilePath("soi.log").c_str());
+    std::printf("did not reach streaming (state: %s). See the log: %s\n",
+                describeState(stateFromToken(state)).c_str(), defaultLogPath().c_str());
     return 1;
 }
 
 int cmdStatus() {
-    unsigned long pid = 0;
-    if (!daemonRunning(&pid)) { std::printf("soi-share: not running\n"); return 1; }
+    const FoundInstance found = findInstance();
+    if (found.cleanedStale)
+        std::printf("(removed a stale record left by an earlier run that did not exit cleanly)\n");
+    if (found.state == InstanceState::None) {
+        std::printf("soi-share: not running\n  start it with: soi-share start\n");
+        return 1;
+    }
+    FoundInstance running;
+    if (!requireRunning(running)) return 1;
 
-    const DaemonState state = currentDaemonState();
-    std::printf("soi-share: %s (pid %lu)\n", describeState(state).c_str(), pid);
-
-    if (std::string code; readStateFile("code.txt", code) && !code.empty())
-        std::printf("  code: %s\n", code.c_str());
-
-    std::string stats;
-    if (state == DaemonState::Streaming && readStateFile("stats.txt", stats) &&
-        !stats.empty())
-        std::printf("  %s\n", stats.c_str());
-
-    std::printf("  log: %s\n", stateFilePath("soi.log").c_str());
+    const auto live = liveStatus(running.record);
+    if (live.empty()) {
+        std::printf("soi-share (pid %lu) did not answer; try again, or `soi-share stop --force`\n",
+                    running.record.pid);
+        return 1;
+    }
+    auto get = [&](const char* key) {
+        const auto it = live.find(key);
+        return it == live.end() ? std::string() : it->second;
+    };
+    const DaemonState state = stateFromToken(get("state"));
+    std::printf("soi-share %s: %s\n", get("version").c_str(), describeState(state).c_str());
+    std::printf("  pid      %s\n", get("pid").c_str());
+    std::printf("  uptime   %s\n", describeUptime(std::atoll(get("uptime").c_str())).c_str());
+    if (const auto code = get("code"); !code.empty()) {
+        std::string host = get("service");
+        if (host.rfind("https://", 0) == 0) host.erase(0, 8);
+        std::printf("  code     %s   (at %s)\n", code.c_str(), host.c_str());
+    }
+    if (const auto urls = get("urls"); !urls.empty())
+        std::printf("  on LAN   %s\n", urls.substr(0, urls.find(' ')).c_str());
+    if (const auto stats = get("stats"); !stats.empty() && state == DaemonState::Streaming)
+        std::printf("  stream   %s\n", stats.c_str());
+    std::printf("  exe      %s\n", get("exe").c_str());
+    std::printf("  log      %s\n", get("log").c_str());
     return 0;
 }
 
 int cmdOffer() {
-    std::string blob;
-    if (!readStateFile("offer.blob", blob) || blob.empty()) {
-        std::printf("no pending offer (either not started, or already connected)\n");
+    FoundInstance found;
+    if (!requireRunning(found)) return 1;
+    const auto live = liveStatus(found.record);
+    const auto it = live.find("offer");
+    if (it == live.end() || it->second.empty()) {
+        std::printf("no pending offer (already connected, or still starting up)\n");
         return 1;
     }
-    std::printf("%s\n", blob.c_str());
-    copyToClipboard(blob);
+    std::printf("%s\n", it->second.c_str());
+    copyToClipboard(it->second);
     return 0;
 }
 
-int cmdStop() {
-    unsigned long pid = 0;
-    if (!daemonRunning(&pid)) { std::printf("soi-share: not running\n"); return 0; }
-
-    if (!signalStop())
-        std::printf("could not signal the daemon; it may still be starting up\n");
-
-    // Give it a few seconds to shut the encoder and peer connection down cleanly.
-    for (int i = 0; i < 60 && daemonRunning(); ++i)
-        std::this_thread::sleep_for(100ms);
-
-    if (daemonRunning()) {
-        std::printf("daemon did not exit; terminating pid %lu\n", pid);
-        if (HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid)) {
-            TerminateProcess(h, 1);
-            CloseHandle(h);
-        }
-        std::this_thread::sleep_for(300ms);
-        clearPidFile();
-    }
-
-    setDaemonState(DaemonState::NotRunning);
-    removeStateFile("offer.blob");
-    removeStateFile("stats.txt");
-    removeStateFile("code.txt");   // display copy only; machine.code persists
-    std::printf("soi-share stopped\n");
-    return 0;
+int cmdStop(bool force) {
+    const StopOutcome out = stopRunningInstance(force, true);
+    return out.stopped ? 0 : 1;
 }
 
 // Wipe SOI's entire on-disk footprint. Unlike `stop`, this also removes the log
 // and the persistent share code, so the next `start` behaves like a first run on
 // a fresh machine. There is nothing to undo, so it says exactly what it did.
 int cmdPurge() {
+    if (findInstance().state != InstanceState::None) {
+        std::printf("cannot purge: soi-share is still running; stop it first (soi-share stop)\n");
+        return 1;
+    }
     int         removed = 0;
     std::string note;
     if (!purgeState(removed, note)) {
@@ -1994,30 +2209,58 @@ int cmdPurge() {
     return 0;
 }
 
-int runDaemon(int argc, char** argv) {
-    if (!acquireInstanceLock()) return 1;   // another daemon owns this session
+// Double-clicked in Explorer. A terminal program opened that way gets a console
+// of its own that closes the instant it exits, so: install, say what this is
+// and how to use it, and wait for Enter.
+int doubleClicked(int argc, char** argv) {
+    std::printf("soi-share %s\n\n", appVersion());
+    const int rc = cmdInstall(/*quiet=*/true);
+    std::printf(
+        "\n"
+        "soi-share is a TERMINAL program; there is no window to open.\n"
+        "Open a new terminal (right-click Start -> Terminal) and type:\n"
+        "\n"
+        "    soi-share start      start sharing; prints a code for your friend\n"
+        "    soi-share status     see what it is doing\n"
+        "    soi-share stop       stop sharing\n"
+        "    soi-share help       everything else\n"
+        "\n");
+    std::printf(rc == 0 ? "Press Enter to close, or type S and Enter to start sharing now: "
+                        : "Press Enter to close: ");
+    std::fflush(stdout);
 
-    logSetFile(stateFilePath("soi.log"));
-    createStopEvent();
-    writePidFile();
-    setDaemonState(DaemonState::Starting);
-
-    Options opt;
-    int rc = 2;
-    if (parseOptions(argc, argv, 2, opt)) {
-        logSetVerbose(opt.verbose);
-        logI("--- soi-share daemon starting (pid {}) ---", GetCurrentProcessId());
-        rc = runSession(opt, true);
+    std::string line;
+    std::getline(std::cin, line);
+    if (rc == 0 && !line.empty() && (line[0] == 's' || line[0] == 'S')) {
+        char* startArgv[] = {argv[0], const_cast<char*>("start")};
+        (void)argc;
+        cmdStart(2, startArgv);
+        std::printf("\nSharing continues in the background after this window closes.\n"
+                    "Press Enter to close: ");
+        std::fflush(stdout);
+        std::getline(std::cin, line);
     }
-
-    setDaemonState(DaemonState::NotRunning);
-    removeStateFile("offer.blob");
-    removeStateFile("stats.txt");
-    removeStateFile("code.txt");   // display copy only; machine.code persists
-    clearPidFile();
-    logI("--- soi-share daemon exiting (rc {}) ---", rc);
-    closeStopEvent();
     return rc;
+}
+
+bool hasFlag(int argc, char** argv, const char* flag) {
+    for (int i = 2; i < argc; ++i)
+        if (std::strcmp(argv[i], flag) == 0) return true;
+    return false;
+}
+
+// Rejects anything but `allowed` after the subcommand, so a typo like
+// `uninstall --purg` does not silently do the non-purging thing.
+bool onlyFlags(int argc, char** argv, std::initializer_list<const char*> allowed) {
+    for (int i = 2; i < argc; ++i) {
+        bool ok = false;
+        for (const char* a : allowed) ok = ok || std::strcmp(argv[i], a) == 0;
+        if (!ok) {
+            std::printf("unknown option for %s: %s (see `soi-share help`)\n", argv[1], argv[i]);
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace
@@ -2026,37 +2269,71 @@ int main(int argc, char** argv) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     SetConsoleCtrlHandler(consoleHandler, TRUE);
 
+    // An exe that `update` or `install` moved aside is deleted on the next run
+    // of any command, once nothing is executing it any more.
+    cleanupOldBinaries();
+
     const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(coHr)) { logE("CoInitializeEx failed: {}", hrString(coHr)); return 1; }
 
-    const HRESULT mfHr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
-    if (FAILED(mfHr)) {
-        logE("MFStartup failed: {}", hrString(mfHr));
-        CoUninitialize();
-        return 1;
+    const std::string cmd = argc > 1 ? argv[1] : "";
+
+    // Media Foundation only for the commands that capture or encode. "N"
+    // editions of Windows ship without it, and install / update / help must
+    // still work there -- if only to tell the user what is missing.
+    const bool needsMedia = cmd == "start" || cmd == "run" || cmd == "--daemon" ||
+                            cmd == "capture-check" || cmd == "gpu-check";
+    // `start` without --foreground only launches the background copy, which
+    // starts Media Foundation itself.
+    const bool launchesOnly = cmd == "start" && !hasFlag(argc, argv, "--foreground");
+    bool mediaUp = false;
+    if (needsMedia && !launchesOnly) {
+        const HRESULT mfHr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
+        if (FAILED(mfHr)) {
+            logE("Media Foundation is not available ({}). On an \"N\" edition of Windows, "
+                 "install the Media Feature Pack: Settings > Apps > Optional features > "
+                 "Add a feature > Media Feature Pack.", hrString(mfHr));
+            CoUninitialize();
+            return 1;
+        }
+        mediaUp = true;
     }
 
-    const std::string cmd = argc > 1 ? argv[1] : "";
     int rc = 0;
 
-    // Double-clicked in Explorer: the console was created for this process alone.
-    // Treat that as `start`, and hold the window open so the code can be read --
-    // otherwise it would flash up and vanish. The share keeps running after the
-    // window closes.
+    // Double-clicked in Explorer: no arguments, and the console was created for
+    // this process alone.
     DWORD consolePids[2] = {};
     const bool ownConsole = GetConsoleProcessList(consolePids, 2) == 1;
 
     if (cmd.empty() && ownConsole) {
-        rc = cmdStart(argc, argv);
-        std::printf("\n  Sharing continues in the background after this window closes.\n"
-                    "  Press any key to close...");
-        std::fflush(stdout);
-        FlushConsoleInputBuffer(GetStdHandle(STD_INPUT_HANDLE));
-        _getch();
-    } else if (cmd.empty() || cmd == "--help" || cmd == "-h" || cmd == "help") {
+        rc = doubleClicked(argc, argv);
+    } else if (cmd.empty() || cmd == "--help" || cmd == "-h" || cmd == "help" || cmd == "/?") {
         printUsage();
+    } else if (cmd == "version" || cmd == "--version" || cmd == "-v") {
+        rc = cmdVersion(hasFlag(argc, argv, "--short"));
+    } else if (cmd == "install") {
+        // install.ps1 fixes up its own session's PATH, so the exe's "open a
+        // new terminal" advice would be wrong there.
+        wchar_t fromScript[4] = {};
+        const bool quiet = GetEnvironmentVariableW(L"SOI_SHARE_INSTALLER", fromScript, 4) == 1 &&
+                           fromScript[0] == L'1';
+        rc = onlyFlags(argc, argv, {}) ? cmdInstall(quiet) : 2;
+    } else if (cmd == "uninstall") {
+        rc = onlyFlags(argc, argv, {"--purge"}) ? cmdUninstall(hasFlag(argc, argv, "--purge")) : 2;
+    } else if (cmd == "update") {
+        rc = onlyFlags(argc, argv, {"--check", "--force", "--forget-token"})
+                 ? cmdUpdate(hasFlag(argc, argv, "--check"), hasFlag(argc, argv, "--force"),
+                             hasFlag(argc, argv, "--forget-token"))
+                 : 2;
+    } else if (cmd == "licenses") {
+        rc = cmdLicenses();
     } else if (cmd == "--daemon") {
-        rc = runDaemon(argc, argv);
+        // How 1.0.x launched its background copy. Kept so a stale shortcut or
+        // script still does something sensible.
+        Options opt;
+        if (!parseOptions(argc, argv, 2, opt)) rc = 2;
+        else rc = runInstance(opt, sessionArgs(argc, argv, 2));
     } else if (cmd == "start") {
         rc = cmdStart(argc, argv);
     } else if (cmd == "answer") {
@@ -2066,7 +2343,7 @@ int main(int argc, char** argv) {
     } else if (cmd == "offer") {
         rc = cmdOffer();
     } else if (cmd == "stop") {
-        rc = cmdStop();
+        rc = onlyFlags(argc, argv, {"--force"}) ? cmdStop(hasFlag(argc, argv, "--force")) : 2;
     } else if (cmd == "purge") {
         rc = cmdPurge();
     } else if (cmd == "list-monitors") {
@@ -2091,12 +2368,12 @@ int main(int argc, char** argv) {
             closeStopEvent();
         }
     } else {
-        logE("unknown command: {}", cmd);
-        printUsage();
+        std::printf("unknown command: %s\nRun `soi-share help` for the list of commands.\n",
+                    cmd.c_str());
         rc = 2;
     }
 
-    MFShutdown();
+    if (mediaUp) MFShutdown();
     CoUninitialize();
     return rc;
 }

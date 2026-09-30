@@ -2,25 +2,29 @@
 //
 // Detached-process control.
 //
-// soi-share runs headless: no window, no console, no GUI. The streaming process
-// is spawned detached so closing the terminal that started it does not kill it,
-// and every control verb (status/offer/answer/stop) works from any other
-// terminal in the same user session.
+// soi-share runs headless: no window, no console, no GUI. `start` relaunches
+// this exe as `start --foreground --log-file <path>` with DETACHED_PROCESS, so
+// closing the terminal that started it does not kill it, and every control verb
+// (status/offer/answer/stop) works from any other terminal in the same user
+// session.
 //
-// State lives in %LOCALAPPDATA%\soi-share:
+// What the running instance is doing lives in ITS memory (setLive / the answer
+// slot below) and is read back over the loopback control channel in
+// app/Control.h -- never from a file written at startup, which goes stale the
+// moment the process crashes.
 //
-//   soi.pid      pid + image path of the running daemon (image path guards
-//                against acting on a recycled pid)
-//   status.txt   one word: starting | gathering | awaiting-answer | connecting |
-//                streaming | stopping | stopped
-//   offer.blob   written by the daemon once ICE gathering completes
-//   answer.blob  written by `soi-share answer`, consumed and deleted by the daemon
-//   soi.log      the daemon's log, since it has no console to write to
+// Files in %LOCALAPPDATA%\soi-share:
 //
-// Shutdown is cooperative: `stop` signals a named event and only escalates to
-// TerminateProcess if the daemon does not exit in time.
+//   machine.code   this PC's persistent share code (the per-device identity)
+//   instance.txt   pid, control port and secret of the running instance
+//   soi-share.log  the instance's log, truncated on each start
+//
+// Shutdown is cooperative: `stop` asks over the control channel, which sets the
+// same event a console Ctrl+C would, and only `stop --force` escalates to
+// TerminateProcess.
 //
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace soi {
@@ -42,9 +46,27 @@ bool removeStateFile(const std::string& leaf);
 // files are in use); `filesRemoved` reports how many were deleted.
 bool purgeState(int& filesRemoved, std::string& note);
 
-void        setDaemonState(DaemonState state);
-DaemonState currentDaemonState();
+// --- live state -------------------------------------------------------------
+//
+// Key/value facts about the running session, held in memory and served by the
+// control channel: "state", "code", "service", "urls", "offer", "stats", ...
+// Values are single-line; a newline would break the wire format.
+
+void setLive(const std::string& key, const std::string& value);
+void clearLive(const std::string& key);
+std::string getLive(const std::string& key);
+std::vector<std::pair<std::string, std::string>> liveSnapshot();
+
+// The viewer's answer, from `soi-share answer` (over the control channel) or
+// from the local handover page. One slot: the latest delivery wins.
+void pushAnswer(const std::string& blob);
+bool takeAnswer(std::string& blob);
+
+void        setDaemonState(DaemonState state);   // sets live "state"
+DaemonState currentDaemonState();                // this process's own state
 std::string describeState(DaemonState state);
+const char* stateToken(DaemonState state);
+DaemonState stateFromToken(const std::string& token);
 
 // --- single instance --------------------------------------------------------
 
@@ -52,29 +74,34 @@ std::string describeState(DaemonState state);
 // running. The lock is released when the process exits.
 bool acquireInstanceLock();
 
-// True if a live daemon owns the pid file. Verifies the recorded image path so a
-// recycled pid is never mistaken for our daemon.
-bool daemonRunning(unsigned long* pidOut = nullptr);
-
-bool writePidFile();
-void clearPidFile();
+// True if a soi-share 1.0.x daemon owns the legacy soi.pid file. Those builds
+// have no control channel, so this is how a new exe finds -- and can stop -- a
+// share an older version started. Verifies the recorded image path so a
+// recycled pid is never mistaken for our daemon. Removes a stale soi.pid.
+bool legacyDaemonRunning(unsigned long* pidOut = nullptr);
 
 // --- stop signalling --------------------------------------------------------
 
-// Created by the daemon, set by `soi-share stop`.
+// Created by the instance. Set by the control channel's "stop", and by
+// signalStop() for 1.0.x daemons, which only listen for the named event.
 bool createStopEvent();
 bool stopRequested();
-bool signalStop();
+void requestStop();      // this process: sets its own stop event
+bool signalStop();       // another process: sets the named event
 void closeStopEvent();
 
 // --- spawning ---------------------------------------------------------------
 
-// Relaunches this executable with `args` plus the internal --daemon flag, fully
-// detached (DETACHED_PROCESS | CREATE_NO_WINDOW). Returns the child pid, or 0.
+// Relaunches this executable with exactly `args`, fully detached
+// (DETACHED_PROCESS: no console at all) and with the state directory as its
+// working directory, so it never pins the folder the user launched it from.
+// Returns the child pid, or 0.
 unsigned long spawnDetached(const std::vector<std::string>& args);
 
-// Polls until the daemon reaches one of `wanted`, or it dies, or timeout.
-bool waitForState(const std::vector<DaemonState>& wanted, int timeoutMs,
-                  DaemonState* reached = nullptr);
+// Quotes one argument so CommandLineToArgvW / the CRT reproduce it exactly.
+std::wstring quoteArg(const std::string& arg);
+
+// Absolute path of this executable.
+std::string currentExePath();
 
 } // namespace soi

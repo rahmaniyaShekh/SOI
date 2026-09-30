@@ -12,15 +12,44 @@ switching between them live if one stops delivering. See §1.2a.
 No GUI. No service to install. No configuration. Runs detached, controlled from any
 terminal.
 
-```
-soi-share start --monitor 0        # detached; prints the offer, opens the viewer
-soi-share answer SOI1:...          # paste the viewer's answer back
-soi-share status                   # from any terminal
-soi-share stop                     # from any terminal
+## Install
+
+On 64-bit Windows 10 (1803+) or 11, you don't need to install anything first: no runtime,
+compiler, package manager, admin rights or DLLs. `soi-share.exe` is the whole program.
+
+**One line in PowerShell.** The repository is private, so you need a read-only GitHub
+token. [SETUP.md](SETUP.md#private-repository-the-access-token) shows how to make one in
+about a minute. The line asks for the token without echoing it:
+
+```powershell
+$env:SOI_SHARE_GITHUB_TOKEN = [Net.NetworkCredential]::new('', (Read-Host 'GitHub token' -AsSecureString)).Password; irm https://api.github.com/repos/rahmaniyaShekh/SOI/contents/install.ps1 -Headers @{ Authorization = "Bearer $env:SOI_SHARE_GITHUB_TOKEN"; Accept = 'application/vnd.github.raw' } | iex
 ```
 
-**Just want to use it?** Download `soi-share.exe` from the Releases page and run it —
-no setup. See [INSTALL.md](INSTALL.md). To build from source, see [SETUP.md](SETUP.md).
+It downloads the latest release, checks its SHA-256, installs it to
+`%LOCALAPPDATA%\Programs\soi-share`, and puts that folder on your PATH. `soi-share` then
+works in the same window and in every new one.
+
+**Or double-click.** Download `soi-share.exe` from the
+[latest release](https://github.com/rahmaniyaShekh/SOI/releases/latest) and double-click it.
+It installs itself the same way and explains what to type next. The exe is unsigned, so if
+SmartScreen appears, click **More info → Run anyway**.
+
+## Use
+
+```powershell
+soi-share start          # start sharing in the background; prints a 6-character code
+soi-share status         # pid, uptime, the code, live stats
+soi-share stop           # stop sharing
+soi-share update         # newest release, checksum-verified, replaced in place
+soi-share uninstall      # remove it (your share code is kept unless --purge)
+soi-share help           # everything else
+```
+
+Your friend opens **https://share.mdarif.online** and types the code. Any modern browser
+works, and they don't need to install anything.
+
+[SETUP.md](SETUP.md) covers the other install options, tokens, updating, uninstalling,
+troubleshooting and (for maintainers) building and releasing.
 
 ---
 
@@ -386,11 +415,12 @@ but honest and ~150 lines.
 # Part 2 — Architecture
 
 ```
-soi-share start ──spawns──► DETACHED daemon (no console, no window)
+soi-share start ──spawns──► start --foreground --log-file ...  (DETACHED: no console)
    │                              │
-   │  offer.blob ◄────────────────┤  %LOCALAPPDATA%\soi-share\
-   │  answer.blob ───────────────►│    soi.pid status.txt offer.blob
-   │  Local\soi-share-stop ──────►│    answer.blob stats.txt soi.log
+   │  127.0.0.1:<ephemeral> ◄────►│  status / stop / answer, secret-checked
+   │                              │  %LOCALAPPDATA%\soi-share\
+   │                              │    instance.txt  (pid, port, secret)
+   │                              │    soi-share.log machine.code
    ▼
  terminal (any terminal: status / answer / stop)
 
@@ -704,16 +734,32 @@ is better than ours.
 
 ## 3.7 Detached operation
 
-`start` re-launches the executable with `--daemon` under `DETACHED_PROCESS |
-CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB` (the last because some terminals put children
-in a job object that kills the whole tree on exit; it retries without it if the job forbids
-breakaway).
+`start` relaunches the executable as `start --foreground --log-file <path>` under
+`DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB`. The first flag gives it no console at all,
+not merely a hidden one. The second is needed because some terminals put children in a job
+object that kills the whole tree on exit; it retries without the flag if the job forbids
+breakaway. Because the child is launched with `--foreground`, it can never detach again.
+Its working directory is the state folder, so it never pins the folder the user typed
+`start` in. `start --foreground` is the same process attached to the terminal, with a live
+log.
 
-State lives in `%LOCALAPPDATA%\soi-share`. Files are written write-then-rename so a reader
-never sees a half-written file. The pid file records the **image path** as well as the pid,
-so a recycled pid belonging to an unrelated process is never mistaken for the daemon and
-killed. Shutdown is cooperative via a named event, escalating to `TerminateProcess` only
-after 6 seconds.
+The running instance keeps everything `status` shows (state, code, LAN URL, stream stats,
+pending offer) **in memory**. It serves that over a control channel on `127.0.0.1`, on an
+ephemeral port, bound with `SO_EXCLUSIVEADDRUSE`. `%LOCALAPPDATA%\soi-share\instance.txt`
+records the port, pid, image path and a random per-run secret. The file is in the user's own
+profile, so another account on the PC can't read the code or stop the share. Every client
+request carries the secret.
+
+If the recorded process is gone after a crash, `TerminateProcess` or a reboot, the next
+command detects that and deletes the record. A recycled pid never counts as ours, because
+the image path must match. Shutdown is cooperative: `stop` asks over the channel, and only
+`stop --force` escalates to `TerminateProcess`. Daemons started by 1.0.x, which predate the
+channel, are still found through their `soi.pid` file and stopped through their named event.
+
+The log, `soi-share.log`, is truncated on each start. The exe also installs, updates and
+uninstalls itself (`src/app/Lifecycle.cpp`): per-user, in
+`%LOCALAPPDATA%\Programs\soi-share`, on the user PATH in `HKCU\Environment`, with the
+program kept separate from the data folder so the share code survives both.
 
 ---
 
@@ -737,17 +783,20 @@ cmake -B build -S . -G "Visual Studio 16 2019" -A x64 `
 cmake --build build --config Release --parallel
 ```
 
-Output: `build\Release\soi-share.exe` plus `viewer.html`.
+Output: `build\Release\soi-share.exe` plus `viewer.html`. Add `-DSOI_VERSION=1.2.3` to stamp a
+version (`soi-share version`); release builds take it from the git tag. The full
+maintainer walkthrough, including cutting a release, is in [SETUP.md](SETUP.md#maintainers-only).
 
 **Runs on any laptop with no extra configuration**: the CRT is linked statically
 (`/MT`), OpenSSL is static, and there is no runtime dependency beyond what ships with
 Windows. `viewer.html` is also compiled into the exe, so **`soi-share.exe` on its own is
 the whole install** — no installer, no redistributable, no admin rights, no GPU required
 (software encoder fallback). A `viewer.html` placed next to the exe overrides the
-embedded copy. Prebuilt binaries are on the GitHub Releases page — see [INSTALL.md](INSTALL.md).
+embedded copy. `tools/check-dlls.ps1` reads the exe's import tables and fails the release
+build if any DLL outside Windows' own ever appears.
 
-Double-clicking the exe does the same as `soi-share start`: it starts sharing in the
-background, shows the code, and waits for a key press before closing its window.
+Double-clicking the exe installs it and explains that it is a terminal program. It then
+waits for Enter, or for S and Enter to start sharing on the spot.
 
 ### Toolchain notes found the hard way
 
@@ -787,8 +836,8 @@ soi-share start --monitor 1 --lock-target
 # this to a screen, and is not told what screens exist.
 soi-share start --window "Visual Studio Code" --cursor
 
-# Foreground, for debugging
-soi-share run --monitor 0 --verbose
+# Foreground with a live log, for debugging (Ctrl+C stops it)
+soi-share start --foreground --verbose
 
 soi-share list-monitors
 soi-share list-windows

@@ -57,20 +57,20 @@ double uptimeSeconds() {
 void logSetVerbose(bool on) { g_verbose.store(on, std::memory_order_relaxed); }
 bool logVerbose()           { return g_verbose.load(std::memory_order_relaxed); }
 
-void logSetFile(const std::string& path) {
+void logSetFile(const std::string& path, bool truncate) {
     std::lock_guard lk(g_mutex);
     if (g_logFile) { std::fclose(g_logFile); g_logFile = nullptr; }
     g_logPath = path;
     if (path.empty()) return;
 
-    // Appended, not truncated: a restart should not erase the record of why the
-    // previous run stopped.
+    // Each `start` truncates, so the log is about this run and cannot grow
+    // without bound on a machine that shares every day.
     //
     // Opened in binary mode with NO "ccs=" encoding. Passing ccs=UTF-8 would put
     // the stream into wide orientation, after which every narrow fprintf below
     // silently writes nothing and the log contains only a BOM. Our strings are
     // already UTF-8, so raw bytes are exactly what we want.
-    g_logFile = _wfopen(toUtf16(path).c_str(), L"ab");
+    g_logFile = _wfopen(toUtf16(path).c_str(), truncate ? L"wb" : L"ab");
 }
 
 void logWrite(LogLevel lvl, std::string_view msg) {

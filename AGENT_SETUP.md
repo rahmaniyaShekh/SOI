@@ -192,8 +192,9 @@ Worker you just deployed. Pass `$svc` explicitly:
 ```
 
 `start` returns immediately — the streamer is detached and survives the terminal closing.
-Do not use `run`: it stays in the foreground, and the terminal window belongs to
-WindowsTerminal.exe, not to this process, so capture exclusion cannot cover it.
+Do not use `run` or `start --foreground`: they stay in the terminal, and the terminal
+window belongs to WindowsTerminal.exe, not to this process, so capture exclusion cannot
+cover it.
 
 **Gate:**
 
@@ -204,7 +205,7 @@ WindowsTerminal.exe, not to this process, so capture exclusion cannot cover it.
 reports a live session (resolution, bitrate, fps). If it does not:
 
 ```powershell
-Get-Content "$env:LOCALAPPDATA\soi-share\soi.log" -Tail 40
+Get-Content "$env:LOCALAPPDATA\soi-share\soi-share.log" -Tail 40
 ```
 
 `ICE failed` means both peers are behind symmetric NAT and a TURN server is needed

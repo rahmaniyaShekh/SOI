@@ -1,83 +1,145 @@
 name: Build and Release
 
+# A v* tag builds, tests and publishes that version. Running it by hand builds
+# and tests the current commit; give it a tag to (re)publish that release.
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish, e.g. v1.2.0 (created on this commit if new). Empty = build and test only.'
+        required: false
+        default: ''
 
-# The default token is read-only; creating a release needs write access.
+# Creating and updating a release needs write access; the default is read-only.
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
   build:
-    runs-on: windows-2022
-
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+      VCPKG_ROOT_DIR: C:\vcpkg
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
-      - name: Cache vcpkg
+      - name: Version from the tag
+        run: |
+          if ($env:TAG) {
+            if ($env:TAG -notmatch '^v(\d+\.\d+\.\d+([-+][0-9A-Za-z.+-]*)?)$') {
+              throw "tag '$env:TAG' is not of the form v1.2.3"
+            }
+            $version = $Matches[1]
+          } else {
+            $version = "0.0.0-dev.$env:GITHUB_RUN_NUMBER"
+          }
+          "VERSION=$version" >> $env:GITHUB_ENV
+          Write-Host "building soi-share $version"
+
+      # OpenSSL is the one dependency not fetched by CMake. The static triplet
+      # is what keeps libcrypto/libssl out of the DLL list.
+      - name: vcpkg cache key
+        id: vcpkg
+        run: |
+          if (-not (Test-Path "$env:VCPKG_ROOT_DIR\vcpkg.exe")) { throw "vcpkg is not at $env:VCPKG_ROOT_DIR on this runner image" }
+          $rev = git -C $env:VCPKG_ROOT_DIR rev-parse --short HEAD
+          "key=vcpkg-openssl-x64-windows-static-$env:ImageOS-$rev" >> $env:GITHUB_OUTPUT
+
+      - name: Cache vcpkg packages
         uses: actions/cache@v4
         with:
           path: C:\vcpkg\installed
-          key: vcpkg-openssl-x64-windows-static-${{ runner.os }}
+          key: ${{ steps.vcpkg.outputs.key }}
 
-      - name: Install OpenSSL via vcpkg
-        run: |
-          vcpkg install openssl:x64-windows-static
-          vcpkg integrate install
+      - name: Install OpenSSL (static)
+        run: '& "$env:VCPKG_ROOT_DIR\vcpkg.exe" install openssl:x64-windows-static'
 
-      - name: Configure CMake
-        run: |
-          cmake -B build -S . `
-            -G "Visual Studio 17 2022" -A x64 `
-            -DCMAKE_TOOLCHAIN_FILE="C:\vcpkg\scripts\buildsystems\vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET=x64-windows-static `
-            -DCMAKE_BUILD_TYPE=Release
+      # No -G: CMake picks the newest Visual Studio on the image, so this keeps
+      # working as windows-latest moves forward.
+      - name: Configure
+        run: >
+          cmake -S . -B build -A x64
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT_DIR/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-windows-static
+          -DSOI_VERSION="$env:VERSION"
+          -DSOI_GITHUB_REPO="${{ github.repository }}"
 
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      - name: Prepare release artifacts
+      - name: Unit tests
         run: |
-          New-Item -ItemType Directory -Force dist
-          Copy-Item build\Release\soi-share.exe dist\
-          Copy-Item build\Release\viewer.html   dist\
-          Compress-Archive -Path dist\* -DestinationPath soi-share-${{ github.ref_name }}-windows-x64.zip
+          .\build\Release\soi-selftest.exe unit
+          if ($LASTEXITCODE -ne 0) { throw "unit tests failed" }
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Only Windows DLLs
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\check-dlls.ps1 build\Release\soi-share.exe
+          if ($LASTEXITCODE -ne 0) { throw "soi-share.exe depends on a DLL that is not part of Windows" }
+
+      - name: Version stamp
+        run: |
+          $v = (& .\build\Release\soi-share.exe version --short | Out-String).Trim()
+          if ($v -ne $env:VERSION) { throw "exe reports '$v', expected '$env:VERSION'" }
+
+      - name: Install / uninstall smoke test
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tests\packaging-smoke.ps1 -Exe build\Release\soi-share.exe -ExpectVersion $env:VERSION -Isolated
+          if ($LASTEXITCODE -ne 0) { throw "packaging smoke test failed" }
+
+      - name: Stage release files
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build\Release\soi-share.exe, install.ps1, viewer\viewer.html, THIRD_PARTY_NOTICES.md dist\
+          $lines = Get-ChildItem dist -File | Sort-Object Name | ForEach-Object {
+            (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant() + '  ' + $_.Name
+          }
+          # sha256sum format, LF endings, no BOM: `sha256sum -c` accepts it as is.
+          [IO.File]::WriteAllText("$PWD\dist\SHA256SUMS.txt", ($lines -join "`n") + "`n")
+          Get-Content dist\SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: "SOI ${{ github.ref_name }}"
-          body: |
-            ## SOI — Serverless P2P Screen Share ${{ github.ref_name }}
+          name: soi-share-${{ env.VERSION }}
+          path: dist/
 
-            Download `soi-share.exe`. That single file is all you need: no installer, no
-            runtime, no admin rights. Windows 10 2004 or later.
+      - name: Publish the release
+        if: env.TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = (Get-Content .github\release-notes.md -Raw).Replace('{{TAG}}', $env:TAG).Replace('{{REPO}}', '${{ github.repository }}')
+          Set-Content -Path notes.md -Value $notes -Encoding utf8
+          $prerelease = @()
+          if ($env:VERSION -match '-') { $prerelease = @('--prerelease') }
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release edit $env:TAG --title "soi-share $env:TAG" --notes-file notes.md
+          } else {
+            gh release create $env:TAG --target $env:GITHUB_SHA --title "soi-share $env:TAG" --notes-file notes.md @prerelease
+          }
+          if ($LASTEXITCODE -ne 0) { throw "could not create or edit the release" }
+          # --clobber replaces same-named assets, so re-running a tag updates it.
+          gh release upload $env:TAG (Get-ChildItem dist -File).FullName --clobber
+          if ($LASTEXITCODE -ne 0) { throw "could not upload the release files" }
 
-            ```powershell
-            .\soi-share.exe start      # runs in the background, prints a 6-character code
-            .\soi-share.exe status     # from any terminal
-            .\soi-share.exe stop       # from any terminal
-            ```
-
-            Or just double-click `soi-share.exe`: it starts sharing and shows the code.
-
-            Your friend opens https://share.mdarif.online and types the code. It works
-            from any network. The zip also contains `viewer.html` for the offline
-            `--no-code` flow.
-
-            First run: the exe is unsigned, so SmartScreen may say "Windows protected
-            your PC" — click **More info → Run anyway**. Allow the firewall prompt on
-            Private networks.
-
-            Install to PATH, updating, uninstalling and troubleshooting:
-            [INSTALL.md](https://github.com/${{ github.repository }}/blob/main/INSTALL.md)
-          files: |
-            dist/soi-share.exe
-            soi-share-${{ github.ref_name }}-windows-x64.zip
-          draft: false
-          prerelease: false
+      # The documented one-liner, in Windows PowerShell 5.1, against what was
+      # just published -- the way a user will run it.
+      - name: Verify the published release installs
+        if: env.TAG != '' && !contains(env.VERSION, '-')
+        shell: powershell
+        env:
+          SOI_SHARE_GITHUB_TOKEN: ${{ github.token }}
+          SOI_SHARE_VERSION: ${{ env.TAG }}
+        run: |
+          irm https://api.github.com/repos/${{ github.repository }}/contents/install.ps1 -Headers @{ Authorization = "Bearer $env:SOI_SHARE_GITHUB_TOKEN"; Accept = 'application/vnd.github.raw' } | iex
+          $v = (soi-share version --short | Out-String).Trim()
+          if ($v -ne $env:VERSION) { throw "installed soi-share reports '$v', expected '$env:VERSION'" }
+          soi-share uninstall --purge

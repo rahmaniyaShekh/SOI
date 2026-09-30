@@ -15,7 +15,8 @@ bool logVerbose();
 
 // Mirrors all output to a file. Required in detached mode, where there is no
 // console for stderr to go to. Passing an empty path disables it again.
-void logSetFile(const std::string& path);
+// `truncate` starts the file afresh; otherwise it is appended to.
+void logSetFile(const std::string& path, bool truncate = false);
 void logWrite(LogLevel lvl, std::string_view msg);
 
 template <class... A> void logT(FormatString<A...> f, A&&... a) {

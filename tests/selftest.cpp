@@ -5,7 +5,12 @@
 //   (no args)                     run the full suite
 //   blob-encode <text> [pass]     print a signalling blob   (Node interop check)
 //   blob-decode <blob> [pass]     print the decoded payload (Node interop check)
+//   unit                          only the sections that need no screen, GPU or
+//                                 media stack -- what CI runs on a headless runner
 //
+#include "app/Control.h"
+#include "app/Install.h"
+#include "app/Update.h"
 #include "capture/BitBltCapture.h"
 #include "capture/CaptureFactory.h"
 #include "capture/CaptureProtect.h"
@@ -15,11 +20,13 @@
 #include "encode/H264Encoder.h"
 #include "encode/Quality.h"
 #include "net/SignalBlob.h"
+#include "util/Json.h"
 #include "util/Log.h"
 #include "util/Parallel.h"
 #include "util/Win.h"
 
 #include <windows.h>
+#include <dpapi.h>
 #include <mfapi.h>
 #include <fcntl.h>
 #include <io.h>
@@ -33,6 +40,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <map>
 #include <numeric>
 #include <random>
 #include <string>
@@ -2117,6 +2125,218 @@ void testEncoder() {
 // Writes bytes verbatim. Windows text-mode stdout rewrites every \n as \r\n,
 // which turns an SDP's \r\n line endings into \r\r\n and silently corrupts any
 // byte-exact comparison downstream.
+
+// ---------------------------------------------------------------------------
+// install / update / control -- the pure logic behind the self-managing exe
+// ---------------------------------------------------------------------------
+void testPathList() {
+    section("user PATH editing");
+    const std::string dir = R"(C:\Users\me\AppData\Local\Programs\soi-share)";
+    bool changed = false;
+    int removed = 0;
+
+    check(pathListAdd("", dir, changed) == dir && changed, "adds to an empty PATH with no separator");
+    check(pathListAdd("C:\\a;C:\\b", dir, changed) == "C:\\a;C:\\b;" + dir && changed,
+          "appends, never prepends");
+    check(pathListAdd("C:\\a;", dir, changed) == "C:\\a;" + dir + ";",
+          "a trailing ';' does not produce ';;', and is kept");
+    {
+        const std::string before = "C:\\a;%USERPROFILE%\\bin;";
+        std::string after = pathListAdd(before, dir, changed);
+        after = pathListRemove(after, dir, removed);
+        check(after == before, "add then remove gives back the exact original value", after);
+    }
+
+    const std::string variants[] = {
+        dir,
+        R"(c:\users\ME\appdata\local\programs\SOI-SHARE)",   // case
+        dir + "\\",                                           // trailing backslash
+        dir + "\\\\",                                         // several
+        "\"" + dir + "\"",                                    // quoted
+        "  " + dir + "  ",                                    // blanks
+    };
+    bool allDedupe = true;
+    for (const auto& v : variants) {
+        const std::string path = "C:\\a;" + v + ";C:\\b";
+        const std::string out = pathListAdd(path, dir, changed);
+        if (changed || out != path) { allDedupe = false; info("not recognised: " + v); }
+    }
+    check(allDedupe, "an existing entry is recognised despite case, quotes, blanks, trailing \\");
+
+    // %LOCALAPPDATA% form, as a hand-edited PATH might hold it.
+    const std::string viaEnv = installDirFor(localAppDataDir());
+    const std::string envForm = R"(%LOCALAPPDATA%\Programs\soi-share)";
+    pathListAdd("C:\\a;" + envForm, viaEnv, changed);
+    check(!changed, "an entry written as %LOCALAPPDATA%\\... counts as present");
+
+    check(pathListCount("x;" + dir + ";y;" + dir + "\\;\"" + dir + "\"", dir) == 3,
+          "counts every spelling of the entry");
+
+    const std::string mixed = "%SystemRoot%\\system32;" + dir + ";C:\\Tools;" + dir + "\\;C:\\x;";
+    const std::string after = pathListRemove(mixed, dir, removed);
+    check(removed == 2 && after == "%SystemRoot%\\system32;C:\\Tools;C:\\x;",
+          "remove drops every spelling and keeps the rest byte for byte (incl. %VARS%)", after);
+
+    const std::string lookalikes = dir + "2;" + dir + "\\bin;C:\\soi-share";
+    check(pathListRemove(lookalikes, dir, removed) == lookalikes && removed == 0,
+          "remove leaves look-alike folders alone");
+    check(pathListRemove("C:\\a", dir, removed) == "C:\\a" && removed == 0,
+          "removing an absent entry changes nothing");
+    check(pathListRemove(dir, dir, removed).empty() && removed == 1,
+          "removing the only entry leaves an empty PATH");
+
+    std::string round = pathListAdd("C:\\a;C:\\b", dir, changed);
+    round = pathListAdd(round, dir, changed);   // idempotent
+    check(!changed && pathListCount(round, dir) == 1, "adding twice leaves exactly one entry");
+    check(pathListRemove(round, dir, removed) == "C:\\a;C:\\b", "add then remove restores the value");
+}
+
+void testInstallDir() {
+    section("install location");
+    check(installDirFor(R"(C:\Users\me\AppData\Local)") ==
+              R"(C:\Users\me\AppData\Local\Programs\soi-share)",
+          "%LOCALAPPDATA%\\Programs\\soi-share");
+    check(installDirFor(R"(C:\Users\me\AppData\Local\)") ==
+              R"(C:\Users\me\AppData\Local\Programs\soi-share)",
+          "a trailing backslash on LOCALAPPDATA is tolerated");
+    check(!localAppDataDir().empty(), "LOCALAPPDATA resolves", localAppDataDir());
+    check(installedExePath() == installDir() + "\\soi-share.exe", "installed exe path");
+    check(samePath("C:\\Windows\\", "c:/windows"), "paths compare like Windows does");
+    check(samePath("C:\\Windows\\System32\\..", "C:\\Windows"), "'..' is resolved before comparing");
+    check(!samePath("C:\\Windows", "C:\\Windows2"), "different folders differ");
+}
+
+void testChecksums() {
+    section("SHA256SUMS.txt");
+    check(sha256Hex("abc", 3) ==
+              "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+          "SHA-256 matches the FIPS 180-2 test vector");
+    check(sha256Hex("", 0) ==
+              "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "SHA-256 of nothing");
+
+    const std::string a(64, 'a'), b(64, 'B');
+    std::string hex;
+    const std::string sums = "\xEF\xBB\xBF" + a + "  soi-share.exe\r\n" + b + " *install.ps1\r\n";
+    check(findChecksum(sums, "soi-share.exe", hex) && hex == a, "finds a text-mode entry (BOM, CRLF)");
+    check(findChecksum(sums, "install.ps1", hex) && hex == std::string(64, 'b'),
+          "finds a binary-mode (*) entry, lowercased");
+    check(findChecksum(sums, "SOI-SHARE.EXE", hex), "file names compare case-insensitively");
+    check(!findChecksum(sums, "viewer.html", hex), "a missing file is not found");
+    check(!findChecksum(sums, "soi-share", hex), "a prefix of a name is not a match");
+    check(!findChecksum(a + "  soi-share.exe\n" + b + "  soi-share.exe\n", "soi-share.exe", hex),
+          "two DIFFERENT sums for one file are refused");
+    check(findChecksum(a + "  soi-share.exe\n" + a + "  soi-share.exe\n", "soi-share.exe", hex),
+          "a repeated identical line is fine");
+    check(!findChecksum(std::string(63, 'a') + "  soi-share.exe\n", "soi-share.exe", hex),
+          "a short hash is ignored");
+    check(!findChecksum(std::string(63, 'a') + "g  soi-share.exe\n", "soi-share.exe", hex),
+          "non-hex is ignored");
+}
+
+void testVersions() {
+    section("versions");
+    Version v;
+    check(parseVersion("v1.2.3", v) && v.major == 1 && v.minor == 2 && v.patch == 3, "v1.2.3");
+    check(parseVersion("10.20.30-rc.1", v) && v.major == 10 && v.patch == 30, "suffix ignored");
+    check(!parseVersion("1.2", v) && !parseVersion("", v) && !parseVersion("v1.2.x", v) &&
+              !parseVersion("1.2.3.4", v),
+          "malformed versions are rejected");
+    Version a, b;
+    parseVersion("1.9.9", a);
+    parseVersion("1.10.0", b);
+    check(compareVersions(a, b) < 0 && compareVersions(b, a) > 0 && compareVersions(a, a) == 0,
+          "compares numerically (1.9.9 < 1.10.0)");
+}
+
+void testTokens() {
+    section("saved GitHub token (DPAPI)");
+    const std::string token = "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz";
+    std::string blob, back;
+    check(protectSecret(token, blob) && !blob.empty(), "encrypts");
+    check(blob.find("github_pat_") == std::string::npos, "the blob does not contain the token");
+    check(unprotectSecret(blob, back) && back == token, "decrypts to the same token");
+
+    std::string tampered = blob;
+    tampered[tampered.size() / 2] = static_cast<char>(tampered[tampered.size() / 2] ^ 0x01);
+    check(!unprotectSecret(tampered, back), "a single flipped bit is detected");
+    check(!unprotectSecret(blob.substr(0, blob.size() - 4), back), "a truncated blob is refused");
+
+    // A DPAPI blob with some other program's entropy must not pass for ours.
+    DATA_BLOB in{static_cast<DWORD>(token.size()),
+                 reinterpret_cast<BYTE*>(const_cast<char*>(token.data()))};
+    DATA_BLOB out{};
+    if (CryptProtectData(&in, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out)) {
+        const std::string foreign(reinterpret_cast<char*>(out.pbData), out.cbData);
+        LocalFree(out.pbData);
+        check(!unprotectSecret(foreign, back), "a blob made without our entropy is refused");
+    }
+
+    check(classifyToken(token) == TokenKind::FineGrained, "github_pat_ is fine-grained");
+    check(classifyToken("ghp_abc") == TokenKind::Classic, "ghp_ is classic");
+    check(classifyToken("gho_abc") == TokenKind::OAuth, "gho_ (GitHub CLI) is OAuth");
+    check(classifyToken(std::string(40, 'f')) == TokenKind::Classic, "40 hex chars is a legacy classic token");
+}
+
+void testJson() {
+    section("JSON reader (release metadata)");
+    const std::string release = R"({
+      "tag_name": "v1.2.0", "html_url": "https://github.com/o/r/releases/tag/v1.2.0",
+      "assets": [
+        {"url": "https://api.github.com/repos/o/r/releases/assets/11", "id": 11,
+         "name": "soi-share.exe", "size": 7340032,
+         "uploader": {"login": "x", "url": "https://api.github.com/users/x", "name": "SHA256SUMS.txt"}},
+        {"url": "https://api.github.com/repos/o/r/releases/assets/12", "id": 12,
+         "name": "SHA256SUMS.txt", "size": 300, "label": null, "draft": false}
+      ]})";
+    Release rel;
+    std::string err;
+    check(parseRelease(release, rel, err) && rel.tag == "v1.2.0" && rel.assets.size() == 2, "parses a release", err);
+    const ReleaseAsset* exe = rel.asset("soi-share.exe");
+    const ReleaseAsset* sums = rel.asset("SHA256SUMS.txt");
+    check(exe && exe->apiUrl.find("/assets/11") != std::string::npos && exe->size == 7340032,
+          "asset url and size come from the asset, not a nested object");
+    check(sums && sums->apiUrl.find("/assets/12") != std::string::npos,
+          "a nested field with the same value does not confuse the lookup");
+
+    JsonValue v;
+    check(JsonValue::parse(R"({"s":"a\"b\\c\u00e9\ud83d\ude00\n"})", v) &&
+              v["s"].str() == "a\"b\\c\xC3\xA9\xF0\x9F\x98\x80\n",
+          "escapes, \\u and surrogate pairs decode to UTF-8");
+    check(JsonValue::parse("[1, -2.5e3, true, null]", v) && v.items().size() == 4 &&
+              v.items()[1].num() == -2500.0,
+          "arrays and numbers");
+    const char* bad[] = {"", "{", "{\"a\":}", "[1,]", "{\"a\":1}x", "\"\\ud800\"", "tru",
+                         "{\"a\" 1}", "\"a\nb\""};
+    bool allBad = true;
+    for (const char* b : bad) allBad = allBad && !JsonValue::parse(b, v);
+    check(allBad, "malformed documents are rejected");
+    std::string deep(200, '[');
+    check(!JsonValue::parse(deep, v), "absurd nesting is rejected, not recursed into");
+}
+
+void testControlFormat() {
+    section("control channel wire format");
+    const std::map<std::string, std::string> kv{
+        {"code", "ABC-DEF"}, {"offer", "SOI1:abc=def=="}, {"stats", "line\nbreak"}, {"empty", ""}};
+    const auto back = parseKeyValues(serializeKeyValues(kv));
+    check(back.at("code") == "ABC-DEF" && back.at("offer") == "SOI1:abc=def==",
+          "values containing '=' survive a round trip");
+    check(back.at("stats") == "line break", "a newline in a value cannot inject a key");
+    check(back.count("empty") && back.at("empty").empty(), "empty values are kept");
+    check(parseKeyValues("a=1\r\nb=2\r\n=bad\nnoequals\n").size() == 2, "CRLF, and junk lines are skipped");
+
+    InstanceRecord rec;
+    check(parseInstanceRecord("pid=1234\nport=50123\nsecret=abcd\nexe=C:\\x.exe\nstarted=1700000000\n", rec) &&
+              rec.pid == 1234 && rec.port == 50123 && rec.secret == "abcd" && rec.startedUnix == 1700000000,
+          "parses an instance record");
+    check(!parseInstanceRecord("pid=1234\nport=0\nsecret=abcd\n", rec), "a record with no port is invalid");
+    check(!parseInstanceRecord("pid=1234\nport=5000\n", rec), "a record with no secret is invalid");
+    check(!processAlive(0) && processAlive(GetCurrentProcessId()), "process liveness");
+    check(!processAlive(GetCurrentProcessId(), "C:\\not\\this.exe"),
+          "a live pid with a different image is not ours (pid reuse)");
+}
+
 void writeRaw(const std::string& text) {
     std::fflush(stdout);
     _setmode(_fileno(stdout), _O_BINARY);
@@ -2260,6 +2480,27 @@ int main(int argc, char** argv) {
         rc = runBlobDecode(argc, argv);
     } else if (argc > 1 && std::strcmp(argv[1], "capture-bench") == 0) {
         rc = runCaptureBench();
+    } else if (argc > 1 && std::strcmp(argv[1], "unit") == 0) {
+        std::printf("\x1b[1msoi-selftest unit\x1b[0m (no screen, GPU or media stack needed)\n");
+        testBase64();
+        testSignalBlob();
+        testColorConvert();
+        testThreadPool();
+        testLevels();
+        testQuality();
+        testPathList();
+        testInstallDir();
+        testChecksums();
+        testVersions();
+        testTokens();
+        testJson();
+        testControlFormat();
+
+        std::printf("\n\x1b[1m== summary ==\x1b[0m\n");
+        std::printf("  \x1b[32m%d passed\x1b[0m", g_pass);
+        if (g_fail) std::printf(", \x1b[31m%d FAILED\x1b[0m", g_fail);
+        std::printf("\n\n");
+        rc = g_fail ? 1 : 0;
     } else {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -2280,6 +2521,13 @@ int main(int argc, char** argv) {
         testEncoder();
         testGpuConvert();
         testGpuPipeline();
+        testPathList();
+        testInstallDir();
+        testChecksums();
+        testVersions();
+        testTokens();
+        testJson();
+        testControlFormat();
 
         std::printf("\n\x1b[1m== summary ==\x1b[0m\n");
         std::printf("  \x1b[32m%d passed\x1b[0m", g_pass);

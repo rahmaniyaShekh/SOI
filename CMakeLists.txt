@@ -1,6 +1,6 @@
 # 3.20 is what Visual Studio 2019 Build Tools bundles; nothing here needs more.
 cmake_minimum_required(VERSION 3.20)
-project(soi-share LANGUAGES CXX VERSION 1.0.0)
+project(soi-share LANGUAGES CXX VERSION 1.1.0)
 
 if(NOT WIN32)
     message(FATAL_ERROR "soi-share targets Windows (Media Foundation + GDI BitBlt).")
@@ -14,6 +14,18 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(OPENSSL_USE_STATIC_LIBS ON)
 set(OPENSSL_MSVC_STATIC_RT  ON)
+
+# Stamped into the exe: `soi-share version`, the updater's comparison, and the
+# file's VERSIONINFO. The release workflow passes the git tag (v1.2.3 -> 1.2.3).
+set(SOI_VERSION "${PROJECT_VERSION}" CACHE STRING "Version stamped into the binaries")
+if(NOT SOI_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)([-+][0-9A-Za-z.+-]*)?$")
+    message(FATAL_ERROR "SOI_VERSION must look like 1.2.3 (got '${SOI_VERSION}')")
+endif()
+set(SOI_VERSION_MAJOR ${CMAKE_MATCH_1})
+set(SOI_VERSION_MINOR ${CMAKE_MATCH_2})
+set(SOI_VERSION_PATCH ${CMAKE_MATCH_3})
+# Where `soi-share update` looks for releases.
+set(SOI_GITHUB_REPO "rahmaniyaShekh/SOI" CACHE STRING "owner/name of the GitHub repository")
 
 option(SOI_BUILD_APP      "Build the full streaming app (needs OpenSSL for libdatachannel)" ON)
 option(SOI_BUILD_SELFTEST "Build the self-test binary" ON)
@@ -84,9 +96,13 @@ FetchContent_MakeAvailable(miniz)
 # OpenSSL or libdatachannel present.
 # ---------------------------------------------------------------------------
 add_library(soi-core STATIC
+    src/app/Control.cpp
+    src/app/Install.cpp
+    src/app/Lifecycle.cpp
     src/app/LocalHandover.cpp
     src/app/Rendezvous.cpp
     src/app/Service.cpp
+    src/app/Update.cpp
     src/capture/BitBltCapture.cpp
     src/capture/CaptureFactory.cpp
     src/capture/CaptureProtect.cpp
@@ -98,6 +114,7 @@ add_library(soi-core STATIC
     src/encode/Quality.cpp
     src/gpu/GpuPipeline.cpp
     src/net/SignalBlob.cpp
+    src/util/Json.cpp
     src/util/Log.cpp
 )
 
@@ -122,6 +139,8 @@ target_link_libraries(soi-core PUBLIC
     d3d11 dxgi runtimeobject d3dcompiler
     bcrypt
     ws2_32 iphlpapi winhttp
+    # Install / update: DPAPI for the saved token, the registry for PATH.
+    crypt32 advapi32
 )
 
 target_compile_definitions(soi-core PUBLIC
@@ -131,6 +150,8 @@ target_compile_definitions(soi-core PUBLIC
     # Windows 10 APIs: SetProcessDpiAwarenessContext, WDA_EXCLUDEFROMCAPTURE,
     # CREATE_WAITABLE_TIMER_HIGH_RESOLUTION.
     WINVER=0x0A00 _WIN32_WINNT=0x0A00 NTDDI_VERSION=0x0A000007
+    SOI_VERSION="${SOI_VERSION}"
+    SOI_GITHUB_REPO="${SOI_GITHUB_REPO}"
 )
 
 if(NOT SOI_HAVE_STD_FORMAT)
@@ -188,27 +209,37 @@ if(SOI_BUILD_APP)
     )
     FetchContent_MakeAvailable(libdatachannel)
 
-    # viewer.html is compiled into the exe as RCDATA 101 (see embeddedViewer() in
-    # main.cpp), so the exe alone is enough on another machine. A viewer.html
-    # placed next to the exe still takes precedence.
-    set(SOI_VIEWER_RC ${CMAKE_CURRENT_BINARY_DIR}/viewer.rc)
-    file(WRITE ${SOI_VIEWER_RC}
-        "101 RCDATA \"${CMAKE_CURRENT_SOURCE_DIR}/viewer/viewer.html\"\n")
+    # Compiled into the exe so it alone is a complete install (ids in
+    # app/Lifecycle.h):
+    #   101  viewer.html -- the LAN handover page. One placed next to the exe
+    #        still takes precedence.
+    #   102  THIRD_PARTY_NOTICES.md -- `soi-share licenses`, and copied beside
+    #        the installed exe by `soi-share install`.
+    # plus VERSIONINFO, so Explorer's Properties > Details shows the version.
+    set(SOI_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+    set(SOI_APP_RC ${CMAKE_CURRENT_BINARY_DIR}/soi-share.rc)
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/src/soi-share.rc.in ${SOI_APP_RC} @ONLY)
 
     add_executable(soi-share
         src/main.cpp
         src/net/Streamer.cpp
-        ${SOI_VIEWER_RC}
+        ${SOI_APP_RC}
     )
-    set_source_files_properties(${SOI_VIEWER_RC} PROPERTIES
-        OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/viewer/viewer.html)
+    set_source_files_properties(${SOI_APP_RC} PROPERTIES OBJECT_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/viewer/viewer.html;${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md")
     target_link_libraries(soi-share PRIVATE
         soi-core
         LibDataChannel::LibDataChannel
         ws2_32 iphlpapi
     )
     if(MSVC)
-        target_link_options(soi-share PRIVATE /SUBSYSTEM:CONSOLE)
+        # No debug information in the shipped exe (Release links without
+        # /DEBUG, so there is no PDB path either); drop unreferenced code and
+        # fold identical functions.
+        target_link_options(soi-share PRIVATE /SUBSYSTEM:CONSOLE
+            $<$<CONFIG:Release>:/OPT:REF /OPT:ICF /INCREMENTAL:NO>)
+    else()
+        target_link_options(soi-share PRIVATE -static -static-libgcc -static-libstdc++ -s)
     endif()
 
     # Keep viewer.html next to the executable so --open-viewer finds it.
@@ -220,4 +251,5 @@ if(SOI_BUILD_APP)
     )
 endif()
 
+message(STATUS "soi: version=${SOI_VERSION}  repo=${SOI_GITHUB_REPO}")
 message(STATUS "soi: std::format=${SOI_HAVE_STD_FORMAT}  app=${SOI_BUILD_APP}  selftest=${SOI_BUILD_SELFTEST}")

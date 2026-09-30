@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include <chrono>
+#include <mutex>
 #include <thread>
 
 namespace soi {
@@ -16,11 +17,9 @@ constexpr wchar_t kStopEventName[] = L"Local\\soi-share-stop";
 HANDLE g_instanceMutex = nullptr;
 HANDLE g_stopEvent     = nullptr;
 
-std::string exePath() {
-    wchar_t buf[MAX_PATH] = {};
-    const DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    return toUtf8(std::wstring_view(buf, n));
-}
+std::mutex                                       g_liveMutex;
+std::vector<std::pair<std::string, std::string>> g_live;
+std::string                                      g_pendingAnswer;
 
 // Trims trailing whitespace; state files are written with no newline but a user
 // may have edited answer.blob by hand.
@@ -35,7 +34,7 @@ std::string trim(std::string s) {
     return s.substr(start);
 }
 
-const char* stateToken(DaemonState s) {
+const char* stateTokenImpl(DaemonState s) {
     switch (s) {
         case DaemonState::NotRunning:     return "stopped";
         case DaemonState::Starting:       return "starting";
@@ -48,7 +47,7 @@ const char* stateToken(DaemonState s) {
     return "stopped";
 }
 
-DaemonState tokenToState(const std::string& t) {
+DaemonState tokenToStateImpl(const std::string& t) {
     if (t == "starting")        return DaemonState::Starting;
     if (t == "gathering")       return DaemonState::Gathering;
     if (t == "awaiting-answer") return DaemonState::AwaitingAnswer;
@@ -57,6 +56,8 @@ DaemonState tokenToState(const std::string& t) {
     if (t == "stopping")        return DaemonState::Stopping;
     return DaemonState::NotRunning;
 }
+
+} // namespace
 
 // Quotes an argument for CommandLineToArgvW round-tripping.
 std::wstring quoteArg(const std::string& arg) {
@@ -81,7 +82,14 @@ std::wstring quoteArg(const std::string& arg) {
     return out;
 }
 
-} // namespace
+std::string currentExePath() {
+    // Long enough for any path Windows will actually run an exe from; a MAX_PATH
+    // buffer truncates deep user profiles.
+    std::wstring buf(32768, L'\0');
+    const DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+    buf.resize(n);
+    return toUtf8(buf);
+}
 
 // ---------------------------------------------------------------------------
 
@@ -149,8 +157,8 @@ bool purgeState(int& filesRemoved, std::string& note) {
     // A running daemon holds soi.log open and is still writing status/stats;
     // wiping under it would race the very files it depends on. Make the caller
     // stop it first.
-    if (daemonRunning()) {
-        note = "a daemon is still running; stop it first (soi-share stop)";
+    if (legacyDaemonRunning()) {
+        note = "soi-share is still running; stop it first (soi-share stop)";
         return false;
     }
 
@@ -183,16 +191,59 @@ bool purgeState(int& filesRemoved, std::string& note) {
     return true;
 }
 
+void setLive(const std::string& key, const std::string& value) {
+    // Single-line by contract: the control channel is one key=value per line.
+    std::string clean = value;
+    for (char& c : clean)
+        if (c == '\n' || c == '\r') c = ' ';
+
+    std::lock_guard lk(g_liveMutex);
+    for (auto& kv : g_live)
+        if (kv.first == key) { kv.second = std::move(clean); return; }
+    g_live.emplace_back(key, std::move(clean));
+}
+
+void clearLive(const std::string& key) {
+    std::lock_guard lk(g_liveMutex);
+    for (auto it = g_live.begin(); it != g_live.end(); ++it)
+        if (it->first == key) { g_live.erase(it); return; }
+}
+
+std::string getLive(const std::string& key) {
+    std::lock_guard lk(g_liveMutex);
+    for (const auto& kv : g_live)
+        if (kv.first == key) return kv.second;
+    return {};
+}
+
+std::vector<std::pair<std::string, std::string>> liveSnapshot() {
+    std::lock_guard lk(g_liveMutex);
+    return g_live;
+}
+
+void pushAnswer(const std::string& blob) {
+    std::lock_guard lk(g_liveMutex);
+    g_pendingAnswer = trim(blob);
+}
+
+bool takeAnswer(std::string& blob) {
+    std::lock_guard lk(g_liveMutex);
+    if (g_pendingAnswer.empty()) return false;
+    blob = std::move(g_pendingAnswer);
+    g_pendingAnswer.clear();
+    return true;
+}
+
 void setDaemonState(DaemonState state) {
-    writeStateFile("status.txt", stateToken(state));
+    setLive("state", stateTokenImpl(state));
 }
 
 DaemonState currentDaemonState() {
-    if (!daemonRunning()) return DaemonState::NotRunning;
-    std::string token;
-    if (!readStateFile("status.txt", token)) return DaemonState::NotRunning;
-    return tokenToState(token);
+    return tokenToStateImpl(getLive("state"));
 }
+
+const char* stateToken(DaemonState state) { return stateTokenImpl(state); }
+DaemonState stateFromToken(const std::string& token) { return tokenToStateImpl(token); }
 
 std::string describeState(DaemonState state) {
     switch (state) {
@@ -220,14 +271,7 @@ bool acquireInstanceLock() {
     return true;
 }
 
-bool writePidFile() {
-    return writeStateFile("soi.pid",
-                          std::to_string(GetCurrentProcessId()) + "\n" + exePath());
-}
-
-void clearPidFile() { removeStateFile("soi.pid"); }
-
-bool daemonRunning(unsigned long* pidOut) {
+bool legacyDaemonRunning(unsigned long* pidOut) {
     std::string raw;
     if (!readStateFile("soi.pid", raw) || raw.empty()) return false;
 
@@ -239,7 +283,7 @@ bool daemonRunning(unsigned long* pidOut) {
     if (pid == 0) return false;
 
     HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!proc) return false;
+    if (!proc) { removeStateFile("soi.pid"); return false; }
 
     DWORD exitCode = 0;
     bool  alive = GetExitCodeProcess(proc, &exitCode) && exitCode == STILL_ACTIVE;
@@ -256,6 +300,7 @@ bool daemonRunning(unsigned long* pidOut) {
     }
     CloseHandle(proc);
 
+    if (!alive) removeStateFile("soi.pid");   // left behind by a crashed 1.0.x daemon
     if (alive && pidOut) *pidOut = pid;
     return alive;
 }
@@ -273,6 +318,10 @@ bool stopRequested() {
     return g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0;
 }
 
+void requestStop() {
+    if (g_stopEvent) SetEvent(g_stopEvent);
+}
+
 bool signalStop() {
     HANDLE h = OpenEventW(EVENT_MODIFY_STATE, FALSE, kStopEventName);
     if (!h) return false;
@@ -288,7 +337,7 @@ void closeStopEvent() {
 // ---------------------------------------------------------------------------
 
 unsigned long spawnDetached(const std::vector<std::string>& args) {
-    std::wstring cmd = quoteArg(exePath());
+    std::wstring cmd = quoteArg(currentExePath());
     for (const auto& a : args) {
         cmd += L' ';
         cmd += quoteArg(a);
@@ -298,21 +347,27 @@ unsigned long spawnDetached(const std::vector<std::string>& args) {
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
 
-    // DETACHED_PROCESS: no console at all, so closing the launching terminal
-    // cannot deliver CTRL_CLOSE_EVENT to us.
+    // DETACHED_PROCESS: no console at all -- not merely a hidden one -- so
+    // closing the launching terminal cannot deliver CTRL_CLOSE_EVENT to us.
     // CREATE_BREAKAWAY_FROM_JOB: some terminals put children in a job object
     // that kills the whole tree when the terminal exits.
-    DWORD flags = DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
+    DWORD flags = DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB;
+
+    // Run from the state directory, not the caller's. A long-lived process
+    // holds its working directory open, which would otherwise stop the user
+    // deleting whatever folder they happened to type `start` in -- including
+    // the install folder during `uninstall`.
+    const std::wstring cwd = toUtf16(stateDirectory());
 
     std::wstring mutableCmd = cmd;
     BOOL ok = CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE,
-                             flags, nullptr, nullptr, &si, &pi);
+                             flags, nullptr, cwd.c_str(), &si, &pi);
     if (!ok && GetLastError() == ERROR_ACCESS_DENIED) {
         // The job object forbids breakaway; retry without it.
         flags &= ~CREATE_BREAKAWAY_FROM_JOB;
         mutableCmd = cmd;
         ok = CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE,
-                            flags, nullptr, nullptr, &si, &pi);
+                            flags, nullptr, cwd.c_str(), &si, &pi);
     }
     if (!ok) {
         logE("CreateProcess failed: {}",
@@ -324,47 +379,6 @@ unsigned long spawnDetached(const std::vector<std::string>& args) {
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return pid;
-}
-
-bool waitForState(const std::vector<DaemonState>& wanted, int timeoutMs,
-                  DaemonState* reached) {
-    const auto start    = std::chrono::steady_clock::now();
-    const auto deadline = start + std::chrono::milliseconds(timeoutMs);
-
-    // A freshly spawned child has not written its pid file yet, so "not running"
-    // initially means "not yet" rather than "gone". Only treat it as terminal
-    // once we have actually seen the daemon alive, or after a startup grace
-    // period -- otherwise `start` races the child and always reports failure.
-    const auto graceEnd = start + std::chrono::seconds(10);
-    bool everSeenAlive = false;
-
-    for (;;) {
-        const bool alive = daemonRunning();
-        if (alive) everSeenAlive = true;
-
-        DaemonState now = DaemonState::NotRunning;
-        if (alive) {
-            std::string token;
-            if (readStateFile("status.txt", token)) now = tokenToState(token);
-        }
-
-        for (DaemonState w : wanted) {
-            if (now == w) {
-                if (reached) *reached = now;
-                return true;
-            }
-        }
-
-        if (!alive && (everSeenAlive || std::chrono::steady_clock::now() >= graceEnd)) {
-            if (reached) *reached = DaemonState::NotRunning;
-            return false;
-        }
-        if (std::chrono::steady_clock::now() >= deadline) {
-            if (reached) *reached = now;
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
 }
 
 } // namespace soi
