@@ -37,6 +37,11 @@ set(SOI_LIBDATACHANNEL_TAG "v0.22.2" CACHE STRING "libdatachannel git tag")
 include(FetchContent)
 include(CheckCXXSourceCompiles)
 
+# CMake 4 refuses projects that declare cmake_minimum_required below 3.5, and
+# miniz 3.0.2 and libdatachannel's bundled usrsctp still do. This lets them
+# configure under their old policies; CMake 3.x ignores the variable.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+
 # ---------------------------------------------------------------------------
 # <format> availability.
 #

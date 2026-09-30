@@ -52,14 +52,24 @@ jobs:
           $rev = git -C $env:VCPKG_ROOT_DIR rev-parse --short HEAD
           "key=vcpkg-openssl-x64-windows-static-$env:ImageOS-$rev" >> $env:GITHUB_OUTPUT
 
-      - name: Cache vcpkg packages
-        uses: actions/cache@v4
+      - name: Restore vcpkg packages
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
         with:
           path: C:\vcpkg\installed
           key: ${{ steps.vcpkg.outputs.key }}
 
       - name: Install OpenSSL (static)
         run: '& "$env:VCPKG_ROOT_DIR\vcpkg.exe" install openssl:x64-windows-static'
+
+      # Saved straight away rather than at the end of the job, so a later step
+      # failing does not throw away a 10-minute OpenSSL build.
+      - name: Save vcpkg packages
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: C:\vcpkg\installed
+          key: ${{ steps.vcpkg.outputs.key }}
 
       # No -G: CMake picks the newest Visual Studio on the image, so this keeps
       # working as windows-latest moves forward.
