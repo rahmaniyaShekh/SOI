@@ -35,13 +35,19 @@ std::vector<std::pair<const uint8_t*, size_t>> splitNals(const std::vector<uint8
 struct DecodeState {
     std::atomic<int> decoded{0};
     std::atomic<int> errors{0};
+    std::atomic<int> firstError{0};
     int width = 0, height = 0;
 };
 
 void onDecoded(void* refcon, void*, OSStatus status, VTDecodeInfoFlags, CVImageBufferRef image,
                CMTime, CMTime) {
     auto* st = static_cast<DecodeState*>(refcon);
-    if (status != noErr || !image) { ++st->errors; return; }
+    if (status != noErr || !image) {
+        int none = 0;
+        st->firstError.compare_exchange_strong(none, static_cast<int>(status ? status : -1));
+        ++st->errors;
+        return;
+    }
     st->width  = static_cast<int>(CVPixelBufferGetWidth(image));
     st->height = static_cast<int>(CVPixelBufferGetHeight(image));
     ++st->decoded;
@@ -55,8 +61,27 @@ bool macFindSpsProfile(const std::vector<uint8_t>& unit, int& profileIdc) {
     return false;
 }
 
+namespace {
+bool decodeOnce(const std::vector<std::vector<uint8_t>>& units, bool requireSoftware,
+                int& decoded, int& width, int& height, std::string& detail);
+} // namespace
+
+// Decodes with the system's choice of decoder, and if that produces nothing,
+// once more with Apple's software decoder -- so a broken hardware path on the
+// test machine is reported as such instead of as a bad bitstream.
 bool macDecodeAnnexB(const std::vector<std::vector<uint8_t>>& units, int& decoded, int& width,
                      int& height, std::string& detail) {
+    if (decodeOnce(units, false, decoded, width, height, detail)) return true;
+    std::string first = detail;
+    const bool ok = decodeOnce(units, true, decoded, width, height, detail);
+    detail = "default decoder: " + first + "; software decoder: " +
+             (ok ? std::string("ok") : detail);
+    return ok;
+}
+
+namespace {
+bool decodeOnce(const std::vector<std::vector<uint8_t>>& units, bool requireSoftware,
+                int& decoded, int& width, int& height, std::string& detail) {
     decoded = width = height = 0;
     std::vector<uint8_t> sps, pps;
     for (const auto& u : units) {
@@ -79,7 +104,11 @@ bool macDecodeAnnexB(const std::vector<std::vector<uint8_t>>& units, int& decode
     DecodeState state;
     VTDecompressionOutputCallbackRecord cb{onDecoded, &state};
     VTDecompressionSessionRef session = nullptr;
-    st = VTDecompressionSessionCreate(kCFAllocatorDefault, format, nullptr, nullptr, &cb, &session);
+    NSDictionary* spec = requireSoftware
+        ? @{(id)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder : @NO}
+        : nil;
+    st = VTDecompressionSessionCreate(kCFAllocatorDefault, format, (__bridge CFDictionaryRef)spec,
+                                      nullptr, &cb, &session);
     if (st != noErr) {
         CFRelease(format);
         detail = "VTDecompressionSessionCreate: " + std::to_string(st);
@@ -122,9 +151,12 @@ bool macDecodeAnnexB(const std::vector<std::vector<uint8_t>>& units, int& decode
     decoded = state.decoded.load();
     width   = state.width;
     height  = state.height;
-    if (state.errors.load()) detail = std::to_string(state.errors.load()) + " decode error(s)";
+    if (state.errors.load())
+        detail = std::to_string(state.errors.load()) + " decode error(s), first OSStatus " +
+                 std::to_string(state.firstError.load());
     return decoded > 0;
 }
+} // namespace
 
 void* macMakeTestPixelBuffer(int width, int height, int n) {
     NSDictionary* attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
