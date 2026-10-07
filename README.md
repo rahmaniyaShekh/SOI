@@ -151,7 +151,28 @@ have a failure rate or a third party in the path.
 
 * Both peers on the same LAN → host candidates connect, **no STUN needed at all**. `--no-stun` gives a genuinely zero-external-contact session.
 * One side behind an ordinary home router → STUN srflx candidates connect. Works.
-* **Both** behind symmetric NAT → **no connection without TURN.** A protocol-level fact, not an implementation gap. The app reports it instead of hanging.
+* **Both** behind NATs that will not talk to each other → no direct path exists, whatever either side does. A protocol-level fact, not an implementation gap. Measured: a viewer behind carrier-grade NAT (a new public port for every destination) facing a router that drops packets from unexpected ports. The viewer saw 90+ connectivity checks sent and not one answered. These sessions go through the relay below (Windows hosts).
+
+### The relay: when two networks cannot reach each other
+
+TURN is not an option on the free Cloudflare plan, so the rendezvous Worker carries the session itself:
+
+1. **The viewer gives up on the direct path quickly.** Seven seconds after posting its answer, it reads `getStats()`. If the candidate pairs have sent more than 10 checks and received no replies, there is no path, and it stops waiting rather than sitting out a 25 s timeout.
+2. **It only asks a host that can do it.** A Windows host publishes `caps: ["relay"]` (and an `owner` secret) with every offer, and `GET /api/room/:id` returns `caps`. Hosts that predate this, and macOS hosts, advertise nothing, so their viewers keep the direct path exactly as before and see *"Your network can't reach … directly. Ask them to update soi-share so the stream can be relayed."* if it keeps failing.
+3. **The key travels in the sealed answer.** The page generates 32 random bytes and posts `{"relay":1,"key":…}` as its answer, on the same session, sealed with the code as usual. The host, still waiting on that session, notices the new answer within a second, closes the unused peer connection and joins the relay. Measured with no direct path: relay requested at 7.5 s, first relayed frame at 8.7 s.
+4. **The Worker forwards ciphertext.** `GET /api/room/:id/relay?session=&role=host|viewer` is a WebSocket held by the room's Durable Object (hibernation API). The host role needs the owner secret from the publish. Each message is forwarded verbatim to the peer socket: up to 1 MiB from the host (keyframes), 64 KiB from the viewer. When one side leaves, the other is closed so it reconnects. A text `ping` is answered by the runtime (`setWebSocketAutoResponse`), so keepalives never wake the object.
+5. **End-to-end encryption.** Every message is `iv(12) | AES-256-GCM(type(1) | payload) | tag(16)` under the viewer's key. Type 1 is H.264 from the host, as `flags(1) | timestamp ms (u32) | length (u32) | Annex B` per frame. Type 2 is the same control JSON the data channel carries (quality, screen, keyframe requests, the viewer's decode backlog). The Worker never has the key.
+6. **Video over TCP.** Nothing is lost, so there is no NACK, FEC or PLI to do. The host sends one message per frame, at most 15 fps, from its own thread. If the send queue backs up, queued delta frames are dropped and a keyframe is forced. The bitrate drops by a quarter when sends start to block or the viewer reports a decode backlog, and rises after 10 clean seconds. The page decodes with WebCodecs `VideoDecoder`, configured from the SPS in the keyframe, and draws into a canvas. If its decode queue grows past 4 frames, it skips to the next keyframe and asks for one. Decryption is chained so frames reach the decoder in arrival order.
+7. **Sticky.** Once the relay has worked in a tab, `sessionStorage['soi.relay.<code>']` makes reconnects go straight to it. Two relay failures in a row and it tries direct again.
+
+The host shows the path in `soi-share status` (`path  relayed through the rendezvous`), and the viewer's strip ends in `relayed`.
+
+**What it costs on the free plan.** Direct sessions never touch the relay. A relayed one uses:
+
+* **Requests.** Workers and Durable Objects allow 100,000 requests a day, and incoming WebSocket messages count 20:1. The host sends up to 15 frame messages a second plus about one control message, and the viewer about one. That is roughly 17 messages, or 0.85 requests, a second: about **30 hours of relayed viewing a day**. The host's answer polling (every 2 s, as before) is counted separately.
+* **Durable Object duration.** 13,000 GB-s a day; a busy object uses about 450 GB-s an hour, so about **29 hours a day**.
+
+So the free plan carries about one relayed viewer around the clock, or several for part of the day. Past the daily limit the relay stops working until the next UTC day; direct sessions are unaffected.
 
 ## 1.2 "BitBlt capture so it's safe from other screen capture"
 
@@ -479,7 +500,9 @@ Media is strictly peer-to-peer after connect. No third party sees pixels.
 | `src/encode/ColorConvert.{h,cpp}` | BGRA→NV12, BT.709 limited, SSE2 `madd`, box downscale, multithreaded |
 | `src/encode/H264Encoder.{h,cpp}` | Media Foundation **async** hardware MFT driver, system-memory and DXGI-surface input |
 | `src/gpu/GpuPipeline.{h,cpp}` | Shared D3D11 device + the BGRA→NV12 conversion shader (§3.2a) |
-| `src/net/Streamer.{h,cpp}` | libdatachannel peer, H264 RTP, RTCP parser, AIMD |
+| `src/net/Streamer.{h,cpp}` | libdatachannel peer, H264 RTP, RTCP parser, AIMD; hands over to the relay |
+| `src/net/RelayLink.{h,cpp}` | The host's end of the relay: send queue, keyframe gating, rate control |
+| `src/net/RelayFrame.{h,cpp}` | The relay's sealed wire format, shared with the viewer page |
 | `src/net/SignalBlob.{h,cpp}` | deflate + AES-256-GCM (CNG) + base64url |
 | `src/util/*` | logging (console + file), COM/GDI RAII, thread pool, `std::format` shim |
 | `tests/selftest.cpp` | 60+ assertions incl. the pixel-level protection proof |

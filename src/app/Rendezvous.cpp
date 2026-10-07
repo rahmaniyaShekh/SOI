@@ -10,8 +10,10 @@
   #include "util/HttpCurl.h"
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -28,6 +30,7 @@ struct HttpResponse {
     int         status = 0;
     std::string body;
     std::string error;
+    unsigned long winError = 0;   // the WinHTTP error behind a transport failure
 };
 
 #if defined(_WIN32)
@@ -43,6 +46,7 @@ public:
     HInternet(HInternet&& o) noexcept : h_(std::exchange(o.h_, nullptr)) {}
 
     HINTERNET get() const { return h_; }
+    HINTERNET release() { return std::exchange(h_, nullptr); }
     explicit operator bool() const { return h_ != nullptr; }
 private:
     HINTERNET h_ = nullptr;
@@ -128,6 +132,19 @@ const Sessions& sessions() {
 // stop paying for a route that is known not to connect.
 std::atomic<bool> g_preferFallback{false};
 
+// Errors that mean "no connection was made", where another route or a fresh
+// connection may well succeed. Anything else is an answer worth reporting.
+bool connectFailure(DWORD err) {
+    return err == ERROR_WINHTTP_CANNOT_CONNECT || err == ERROR_WINHTTP_TIMEOUT ||
+           err == ERROR_WINHTTP_NAME_NOT_RESOLVED || err == ERROR_WINHTTP_CONNECTION_ERROR;
+}
+
+// The connect step is capped at 3.5 s. On a network that intermittently drops
+// SYNs to one of Cloudflare's addresses, an uncapped connect waits out TCP's
+// 21 s retry: measured, every other start took 17-25 s before the code was
+// published. A fresh connection usually lands on the other address instead.
+constexpr int kConnectTimeoutMs = 3500;
+
 HttpResponse httpRequestOn(HINTERNET session, const std::string& baseUrl,
                            const std::string& path, const char* method,
                            const std::string& body, int timeoutMs) {
@@ -149,7 +166,8 @@ HttpResponse httpRequestOn(HINTERNET session, const std::string& baseUrl,
     // Per-request, so a name-resolution or connect stall gives up quickly and
     // the caller's retry gets a fresh go, while still allowing a slow-but-alive
     // link the full budget to send and receive.
-    WinHttpSetTimeouts(request.get(), 5000, 5000, timeoutMs, timeoutMs);
+    WinHttpSetTimeouts(request.get(), std::min(timeoutMs, 5000),
+                       std::min(timeoutMs, kConnectTimeoutMs), timeoutMs, timeoutMs);
 
     const std::wstring headers = L"Content-Type: application/json\r\n";
 
@@ -160,11 +178,13 @@ HttpResponse httpRequestOn(HINTERNET session, const std::string& baseUrl,
                                          : const_cast<char*>(body.data()),
                             static_cast<DWORD>(body.size()),
                             static_cast<DWORD>(body.size()), 0)) {
-        out.error = "request failed (" + std::to_string(GetLastError()) + ")";
+        out.winError = GetLastError();
+        out.error = "request failed (" + std::to_string(out.winError) + ")";
         return out;
     }
     if (!WinHttpReceiveResponse(request.get(), nullptr)) {
-        out.error = "no response (" + std::to_string(GetLastError()) + ")";
+        out.winError = GetLastError();
+        out.error = "no response (" + std::to_string(out.winError) + ")";
         return out;
     }
 
@@ -202,6 +222,15 @@ HttpResponse httpRequest(const std::string& baseUrl, const std::string& path,
                                        baseUrl, path, method, body, timeoutMs);
     if (first.transportOk) return first;
 
+    // Once more on the same route with a fresh connection before trying the
+    // other one: a connect that timed out has usually just picked an address
+    // the network is dropping packets to.
+    if (connectFailure(first.winError)) {
+        HttpResponse again = httpRequestOn(viaFallback ? s.fallback : s.primary,
+                                           baseUrl, path, method, body, timeoutMs);
+        if (again.transportOk) return again;
+    }
+
     HINTERNET other = viaFallback ? s.primary : s.fallback;
     if (!other) return first;
     HttpResponse second = httpRequestOn(other, baseUrl, path, method, body, timeoutMs);
@@ -211,6 +240,131 @@ HttpResponse httpRequest(const std::string& baseUrl, const std::string& path,
     logI("rendezvous reachable {}; using that from now on",
          viaFallback ? "directly" : "only through the system proxy");
     return second;
+}
+
+// The relay socket: a WinHTTP WebSocket, so it uses Schannel and the same proxy
+// routes as every other rendezvous call.
+class WinRelaySocket final : public RelaySocket {
+public:
+    WinRelaySocket(HINTERNET connect, HINTERNET ws) : connect_(connect), ws_(ws) {}
+    ~WinRelaySocket() override {
+        close();
+        if (connect_) WinHttpCloseHandle(connect_);
+    }
+
+    bool sendBinary(const uint8_t* data, size_t len) override {
+        return send(WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, data, len);
+    }
+    bool sendText(const std::string& text) override {
+        return send(WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, text.data(), text.size());
+    }
+
+    bool receive(std::string& message, bool& binary) override {
+        message.clear();
+        std::vector<char> buf(64 * 1024);
+        for (;;) {
+            const HINTERNET h = handle();
+            if (!h) return false;
+            DWORD got = 0;
+            WINHTTP_WEB_SOCKET_BUFFER_TYPE type{};
+            const DWORD err = WinHttpWebSocketReceive(h, buf.data(), static_cast<DWORD>(buf.size()),
+                                                      &got, &type);
+            if (err != NO_ERROR || type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) {
+                closed_.store(true);
+                return false;
+            }
+            message.append(buf.data(), got);
+            if (message.size() > 2 * 1024 * 1024) { closed_.store(true); return false; }
+            if (type == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE ||
+                type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE) {
+                binary = type == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE;
+                return true;
+            }
+        }
+    }
+
+    // Abortive on purpose: a graceful close handshake can block for as long as
+    // the far side takes to answer, and this runs on the shutdown path. Closing
+    // the handle unblocks a send or receive pending on another thread. The
+    // handle is taken under the lock and closed outside it, so a thread that
+    // needs the lock to finish its own call can never deadlock against this.
+    void close() override {
+        closed_.store(true);
+        HINTERNET h = nullptr;
+        {
+            std::lock_guard lk(mtx_);
+            h = std::exchange(ws_, nullptr);
+        }
+        if (h) WinHttpCloseHandle(h);
+    }
+
+private:
+    HINTERNET handle() {
+        std::lock_guard lk(mtx_);
+        return closed_.load() ? nullptr : ws_;
+    }
+
+    bool send(WINHTTP_WEB_SOCKET_BUFFER_TYPE type, const void* data, size_t len) {
+        const HINTERNET h = handle();
+        if (!h) return false;
+        std::lock_guard lk(sendMtx_);   // one message at a time on the wire
+        if (WinHttpWebSocketSend(h, type, const_cast<void*>(data), static_cast<DWORD>(len)) !=
+            NO_ERROR) {
+            closed_.store(true);
+            return false;
+        }
+        return true;
+    }
+
+    HINTERNET         connect_ = nullptr;
+    HINTERNET         ws_      = nullptr;
+    std::mutex        mtx_;       // guards ws_ only, never held across a call
+    std::mutex        sendMtx_;
+    std::atomic<bool> closed_{false};
+};
+
+std::unique_ptr<RelaySocket> openWebSocketOn(HINTERNET session, const std::string& baseUrl,
+                                             const std::string& path, std::string& error,
+                                             DWORD& winError) {
+    winError = 0;
+    const ParsedUrl url = parseUrl(baseUrl, path);
+    if (!url.valid) { error = "malformed rendezvous URL: " + baseUrl; return nullptr; }
+    if (!session) { error = "WinHttpOpen failed"; return nullptr; }
+
+    HInternet connect(WinHttpConnect(session, url.host.c_str(), url.port, 0));
+    if (!connect) { error = "cannot connect to the rendezvous host"; return nullptr; }
+    HInternet request(WinHttpOpenRequest(connect.get(), L"GET", url.path.c_str(), nullptr,
+                                         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                         url.https ? WINHTTP_FLAG_SECURE : 0));
+    if (!request) { error = "WinHttpOpenRequest failed"; return nullptr; }
+
+    // The same connect cap as every other call; receive waits forever, because
+    // a relay that is quiet is not a relay that has failed.
+    WinHttpSetTimeouts(request.get(), 5000, kConnectTimeoutMs, 10000, 0);
+    WinHttpSetOption(request.get(), WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0);
+    if (!WinHttpSendRequest(request.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(request.get(), nullptr)) {
+        winError = GetLastError();
+        error = "relay connect failed (" + std::to_string(winError) + ")";
+        return nullptr;
+    }
+    DWORD status = 0, statusSize = sizeof(status);
+    WinHttpQueryHeaders(request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize,
+                        WINHTTP_NO_HEADER_INDEX);
+    if (status != 101) {
+        error = "the rendezvous refused the relay (HTTP " + std::to_string(status) + ")";
+        return nullptr;
+    }
+    HINTERNET ws = WinHttpWebSocketCompleteUpgrade(request.get(), 0);
+    if (!ws) {
+        error = "relay upgrade failed (" + std::to_string(GetLastError()) + ")";
+        return nullptr;
+    }
+    // The request handle is finished with once the upgrade completes; the
+    // connection handle must outlive the WebSocket.
+    return std::make_unique<WinRelaySocket>(connect.release(), ws);
 }
 
 #else
@@ -234,7 +388,7 @@ HttpResponse httpRequest(const std::string& baseUrl, const std::string& path,
     req.url              = base + path;
     req.method           = method;
     req.body             = body;
-    req.connectTimeoutMs = 5000;
+    req.connectTimeoutMs = 3500;
     req.totalTimeoutMs   = timeoutMs + 5000;
     req.userAgent        = "soi-share/1.0";
     if (!body.empty()) req.headers.push_back("Content-Type: application/json");
@@ -328,9 +482,13 @@ RendezvousResult publishOffer(const std::string& baseUrl, const std::string& roo
                               const std::string& sealedOffer) {
     RendezvousResult result;
 
+    // owner and caps are ignored by a rendezvous that predates the relay, and a
+    // viewer page that predates it never asks for one, so both stay compatible.
     const std::string body =
         "{\"id\":\"" + jsonEscape(roomId) + "\",\"session\":\"" + jsonEscape(sessionId) +
-        "\",\"offer\":\"" + jsonEscape(sealedOffer) + "\"}";
+        "\",\"offer\":\"" + jsonEscape(sealedOffer) + "\",\"owner\":\"" +
+        jsonEscape(hostOwnerToken()) + "\",\"caps\":[" + (relaySupported() ? "\"relay\"" : "") +
+        "]}";
 
     // Publishing is the one call the whole short-code route depends on, and a
     // single timeout used to cost the entire session its code: the sender fell
@@ -419,12 +577,68 @@ RendezvousResult waitForAnswer(const std::string& baseUrl, const std::string& ro
     return result;   // ok=false, no error: simply nobody joined
 }
 
+RendezvousResult pollAnswerOnce(const std::string& baseUrl, const std::string& roomId,
+                                const std::string& sessionId, std::string& sealedAnswer) {
+    RendezvousResult result;
+    sealedAnswer.clear();
+    const HttpResponse res = httpRequest(
+        baseUrl, "/api/room/" + roomId + "/answer?session=" + sessionId, "GET", "", 5000);
+    if (!res.transportOk) {
+        result.error = res.error.empty() ? "rendezvous unreachable" : res.error;
+        return result;
+    }
+    if (res.status == 200) sealedAnswer = jsonString(res.body, "answer");
+    result.ok = res.status == 200 || res.status == 204;
+    if (!result.ok) result.error = "rendezvous returned HTTP " + std::to_string(res.status);
+    return result;
+}
+
+const std::string& hostOwnerToken() {
+    static const std::string token = randomHex(16);
+    return token;
+}
+
+#if defined(_WIN32)
+bool relaySupported() { return !hostOwnerToken().empty(); }
+
+std::unique_ptr<RelaySocket> openRelaySocket(const std::string& baseUrl,
+                                             const std::string& roomId,
+                                             const std::string& sessionId,
+                                             std::string& error) {
+    const std::string path = "/api/room/" + roomId + "/relay?session=" + sessionId +
+                             "&role=host&owner=" + hostOwnerToken();
+    // The route that last worked, a fresh connection on it, then the other one:
+    // the same order as every other call, for the same reasons.
+    const Sessions& s = sessions();
+    const bool viaFallback = g_preferFallback.load();
+    const HINTERNET order[] = {viaFallback ? s.fallback : s.primary,
+                               viaFallback ? s.fallback : s.primary,
+                               viaFallback ? s.primary : s.fallback};
+    for (int i = 0; i < 3; ++i) {
+        DWORD winError = 0;
+        if (auto ws = openWebSocketOn(order[i], baseUrl, path, error, winError)) return ws;
+        if (!connectFailure(winError)) return nullptr;   // refused, not unreachable
+    }
+    return nullptr;
+}
+#else
+// The relay is Windows-only for now; macOS hosts do not advertise it, so their
+// viewers keep the direct path exactly as before.
+bool relaySupported() { return false; }
+
+std::unique_ptr<RelaySocket> openRelaySocket(const std::string&, const std::string&,
+                                             const std::string&, std::string& error) {
+    error = "the relay is not available on this platform";
+    return nullptr;
+}
+#endif
+
 RendezvousResult closeRoom(const std::string& baseUrl, const std::string& roomId) {
     RendezvousResult result;
     // Short timeout: this runs on the shutdown path and must never be the
     // reason the daemon is slow to exit.
     const HttpResponse res =
-        httpRequest(baseUrl, "/api/room/" + roomId, "DELETE", "", 5000);
+        httpRequest(baseUrl, "/api/room/" + roomId, "DELETE", "", 2500);
     if (!res.transportOk) {
         result.error = res.error.empty() ? "could not reach the rendezvous" : res.error;
         return result;

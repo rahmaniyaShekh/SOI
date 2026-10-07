@@ -265,13 +265,32 @@ bool removeZoneIdentifier(const std::string& path) {
     return err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND;
 }
 
+// Retries `step` for up to five seconds. A process that has just exited, or an
+// antivirus scan of a file that was just written, holds it for a moment, and
+// an update that gives up on the first sharing violation has already stopped
+// the share it was meant to restart.
+template <typename Step>
+bool retryFileStep(Step step) {
+    const ULONGLONG deadline = GetTickCount64() + 5000;
+    for (;;) {
+        if (step()) return true;
+        const DWORD err = GetLastError();
+        if (err != ERROR_SHARING_VIOLATION && err != ERROR_ACCESS_DENIED &&
+            err != ERROR_LOCK_VIOLATION)
+            return false;
+        if (GetTickCount64() >= deadline) return false;
+        Sleep(100);
+        SetLastError(err);
+    }
+}
+
 bool replaceExecutable(const std::string& target, const std::string& source, std::string& error) {
     const std::wstring wTarget = toUtf16(target);
     const std::wstring wStage  = toUtf16(target + ".new");
 
     // Stage next to the target first, so the final step is a rename on one
     // volume: atomic, and it cannot leave a half-written exe in place.
-    if (!CopyFileW(toUtf16(source).c_str(), wStage.c_str(), FALSE)) {
+    if (!retryFileStep([&] { return CopyFileW(toUtf16(source).c_str(), wStage.c_str(), FALSE); })) {
         error = "could not copy the new exe into " + directoryOf(target) + ": " + lastErrorText();
         return false;
     }
@@ -280,19 +299,25 @@ bool replaceExecutable(const std::string& target, const std::string& source, std
                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
         return true;
 
-    // The target is running (ours, or a share still in progress). Rename it
-    // aside -- allowed for a running image -- then move the new one in.
+    // The target is running (ours, or a share still in progress) and cannot be
+    // overwritten -- 0x80070020 -- but a running image CAN be renamed. Move it
+    // aside under a fresh name, then move the new one in.
     std::wstring aside = wTarget + L".old";
-    if (!MoveFileExW(wTarget.c_str(), aside.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+    const bool movedAside = retryFileStep([&] {
+        if (MoveFileExW(wTarget.c_str(), aside.c_str(), MOVEFILE_REPLACE_EXISTING)) return true;
         // An even older *.old may itself still be running; pick a fresh name.
+        const DWORD err = GetLastError();
         aside = wTarget + L"." + std::to_wstring(GetTickCount64()) + L".old";
-        if (!MoveFileExW(wTarget.c_str(), aside.c_str(), 0)) {
-            error = "could not move the old " + target + " aside: " + lastErrorText();
-            DeleteFileW(wStage.c_str());
-            return false;
-        }
+        if (MoveFileExW(wTarget.c_str(), aside.c_str(), 0)) return true;
+        if (GetLastError() == ERROR_ALREADY_EXISTS) SetLastError(err);
+        return false;
+    });
+    if (!movedAside) {
+        error = "could not move the old " + target + " aside: " + lastErrorText();
+        DeleteFileW(wStage.c_str());
+        return false;
     }
-    if (!MoveFileExW(wStage.c_str(), wTarget.c_str(), MOVEFILE_WRITE_THROUGH)) {
+    if (!retryFileStep([&] { return MoveFileExW(wStage.c_str(), wTarget.c_str(), MOVEFILE_WRITE_THROUGH); })) {
         error = "could not move the new exe into place: " + lastErrorText();
         MoveFileExW(aside.c_str(), wTarget.c_str(), 0);   // roll back
         DeleteFileW(wStage.c_str());

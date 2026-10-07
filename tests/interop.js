@@ -196,6 +196,60 @@ const PASSPHRASE = 'correct-horse-battery-staple';
                 : bad('URL fragment hand-off', 'content differs');
   } catch (e) { bad('URL fragment hand-off', e.message); }
 
+  // --- the relay: iv(12) | AES-256-GCM(type | payload) | tag(16) ------------
+  // The viewer page seals and opens these with WebCrypto exactly as below.
+  const hex = b => Buffer.from(b).toString('hex');
+  const rawKey = crypto.getRandomValues(new Uint8Array(32));
+  const relayKey = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['encrypt', 'decrypt']);
+
+  // 9. C++ seals a video message -> the page opens it and walks the frame
+  try {
+    const nal = new Uint8Array([0, 0, 0, 1, 0x67, 0x4d, 0x00, 0x28, 0, 0, 0, 1, 0x65, 9, 8, 7]);
+    const frame = concat(new Uint8Array([1, 0, 0, 1, 0x2c, 0, 0, 0, nal.length]), nal);   // key, 300 ms
+    const sealed = Buffer.from(execFileSync(EXE, ['relay-seal', hex(rawKey), '1', hex(frame)],
+                                            { encoding: 'utf8' }), 'hex');
+    const plain = new Uint8Array(await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: sealed.subarray(0, 12) }, relayKey, sealed.subarray(12)));
+    const p = plain.subarray(1);
+    const ts = ((p[1] << 24) | (p[2] << 16) | (p[3] << 8) | p[4]) >>> 0;
+    const len = ((p[5] << 24) | (p[6] << 16) | (p[7] << 8) | p[8]) >>> 0;
+    plain[0] === 1 && (p[0] & 1) === 1 && ts === 300 && len === nal.length &&
+      Buffer.compare(Buffer.from(p.subarray(9)), Buffer.from(nal)) === 0
+      ? ok('C++ seals a relay video message -> browser opens it')
+      : bad('C++ seals a relay video message -> browser opens it', 'content differs');
+  } catch (e) { bad('C++ seals a relay video message -> browser opens it', e.message); }
+
+  // 10. the page seals control JSON -> C++ opens it
+  try {
+    const json = new TextEncoder().encode('{"type":"setQuality","level":"1080p"}');
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv }, relayKey, concat(new Uint8Array([2]), json)));
+    const out = execFileSync(EXE, ['relay-open', hex(rawKey), hex(concat(iv, ct))], { encoding: 'utf8' });
+    out === `2 ${hex(json)}` ? ok('browser seals relay control -> C++ opens it')
+                             : bad('browser seals relay control -> C++ opens it', out);
+  } catch (e) { bad('browser seals relay control -> C++ opens it', e.message); }
+
+  // 11. a message under another key is refused by C++
+  try {
+    const other = await crypto.subtle.importKey('raw', crypto.getRandomValues(new Uint8Array(32)),
+                                                'AES-GCM', false, ['encrypt']);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, other,
+                                                          new Uint8Array([2, 123, 125])));
+    execFileSync(EXE, ['relay-open', hex(rawKey), hex(concat(iv, ct))], { stdio: 'ignore' });
+    bad('C++ refuses a relay message under another key', 'it opened it');
+  } catch { ok('C++ refuses a relay message under another key'); }
+
+  // 12. the page's relay request, sealed in the answer, yields the same key in C++
+  try {
+    const request = JSON.stringify({ relay: 1, key: b64urlEncode(rawKey) });
+    const opened = cppDecode(await encodeBlob(request, PASSPHRASE), PASSPHRASE);
+    const out = execFileSync(EXE, ['relay-request', opened], { encoding: 'utf8' });
+    out === hex(rawKey) ? ok('the relay key travels in the sealed answer intact')
+                        : bad('the relay key travels in the sealed answer intact', out);
+  } catch (e) { bad('the relay key travels in the sealed answer intact', e.message); }
+
   console.log(`\n  \x1b[32m${pass} passed\x1b[0m${fail ? `, \x1b[31m${fail} FAILED\x1b[0m` : ''}\n`);
   process.exit(fail ? 1 : 0);
 })();

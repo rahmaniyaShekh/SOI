@@ -161,6 +161,18 @@ bool Streamer::start(const StreamerConfig& cfg) {
 
         pc_ = std::make_shared<rtc::PeerConnection>(config);
 
+        pc_->onLocalCandidate([this](rtc::Candidate c) {
+            if (c.type() != rtc::Candidate::Type::ServerReflexive &&
+                c.type() != rtc::Candidate::Type::Relayed)
+                return;
+            {
+                std::lock_guard lk(mtx_);
+                if (firstPublicCandidate_ == std::chrono::steady_clock::time_point{})
+                    firstPublicCandidate_ = std::chrono::steady_clock::now();
+            }
+            cv_.notify_all();
+        });
+
         pc_->onGatheringStateChange([this](rtc::PeerConnection::GatheringState state) {
             logT("ICE gathering state: {}",
                  state == rtc::PeerConnection::GatheringState::Complete ? "complete"
@@ -270,6 +282,7 @@ bool Streamer::start(const StreamerConfig& cfg) {
 
 void Streamer::stop() {
     if (!running_.exchange(false)) return;
+    relay_.reset();   // closes the relay socket and joins its threads
     try {
         if (control_) control_->close();
         if (track_)   track_->close();
@@ -285,9 +298,27 @@ void Streamer::stop() {
     connected_.store(false);
 }
 
-bool Streamer::waitForGathering(std::chrono::milliseconds timeout) {
+bool Streamer::waitForGathering(std::chrono::milliseconds timeout,
+                                const std::function<bool()>& cancel) {
+    using namespace std::chrono_literals;
+    const auto t0 = std::chrono::steady_clock::now();
     std::unique_lock lk(mtx_);
-    return cv_.wait_for(lk, timeout, [this] { return gatheringComplete_; });
+    while (!gatheringComplete_) {
+        if (cancel && cancel()) return false;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - t0 >= timeout) break;
+        if (firstPublicCandidate_ != std::chrono::steady_clock::time_point{} &&
+            now - firstPublicCandidate_ >= 1s)
+            break;
+        cv_.wait_for(lk, 100ms);
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+    if (gatheringComplete_) logT("ICE gathering complete in {} ms", ms);
+    else logT("ICE gathering {} after {} ms; offering what we have",
+              firstPublicCandidate_ != std::chrono::steady_clock::time_point{}
+                  ? "still running" : "found no public address", ms);
+    return gatheringComplete_;
 }
 
 std::string Streamer::localDescriptionSdp() const {
@@ -307,15 +338,87 @@ bool Streamer::acceptAnswer(const std::string& sdp, std::string& error) {
     }
 }
 
-bool Streamer::waitForConnected(std::chrono::milliseconds timeout) {
+bool Streamer::waitForConnected(std::chrono::milliseconds timeout,
+                                const std::function<bool()>& cancel) {
+    using namespace std::chrono_literals;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     std::unique_lock lk(mtx_);
-    return cv_.wait_for(lk, timeout, [this] {
-        return connected_.load() || failed_.load();
-    }) && connected_.load();
+    while (!connected_.load() && !failed_.load()) {
+        if (cancel && cancel()) return false;
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        cv_.wait_for(lk, 100ms);
+    }
+    return connected_.load();
+}
+
+void Streamer::startRelay(std::unique_ptr<RelaySocket> socket, RelayKey key) {
+    // The peer connection was built for an answer that is never coming. Its
+    // callbacks go first, so closing it cannot report a state over the relay's.
+    try {
+        if (control_) control_->resetCallbacks();
+        if (track_)   track_->resetCallbacks();
+        if (pc_) {
+            pc_->resetCallbacks();
+            pc_->close();
+        }
+    } catch (const std::exception& e) {
+        logT("closing the unused peer connection: {}", e.what());
+    }
+    {
+        std::lock_guard lk(mtx_);
+        connected_.store(false);
+        failed_.store(false);
+    }
+    relayed_.store(true);
+
+    RelayLink::Callbacks cb;
+    cb.onLive = [this] {
+        {
+            std::lock_guard lk(mtx_);
+            connected_.store(true);
+        }
+        cv_.notify_all();
+        if (onState_) onState_("connected");
+        // The viewer's decoder cannot start without a keyframe, and the page
+        // shows its controls once it knows what is on offer.
+        if (onKeyframe_) onKeyframe_();
+        if (onControlReady_) onControlReady_();
+    };
+    cb.onClosed = [this] {
+        {
+            std::lock_guard lk(mtx_);
+            connected_.store(false);
+            failed_.store(true);
+        }
+        cv_.notify_all();
+        if (onState_) onState_("closed");
+    };
+    cb.onKeyframe = [this] {
+        pliCount_.fetch_add(1);
+        if (onKeyframe_) onKeyframe_();
+    };
+    cb.onBitrate = [this](int kbps) {
+        targetKbps_.store(kbps);
+        if (onBitrate_) onBitrate_(kbps);
+    };
+    cb.onControl = [this](const std::string& text) { handleControlMessage(text); };
+
+    // Start well inside what a TCP path through the rendezvous carries, and let
+    // the relay's own control find the rest.
+    const int start = std::clamp(1500, cfg_.minBitrateKbps, cfg_.maxBitrateKbps);
+    targetKbps_.store(start);
+    relay_ = std::make_unique<RelayLink>(std::move(socket), std::move(key), std::move(cb), start,
+                                         cfg_.minBitrateKbps,
+                                         std::min(cfg_.maxBitrateKbps, 6000));
+    if (onBitrate_) onBitrate_(start);
 }
 
 void Streamer::sendFrame(const uint8_t* annexB, size_t len, bool keyframe,
                          int64_t ptsNs) {
+    if (relayed_.load()) {
+        if (relay_) relay_->sendFrame(annexB, len, keyframe, ptsNs);
+        return;
+    }
     if (!track_ || len == 0) return;
     if (!track_->isOpen()) return;
 
@@ -345,10 +448,15 @@ void Streamer::sendFrame(const uint8_t* annexB, size_t len, bool keyframe,
 }
 
 bool Streamer::controlIsOpen() const {
+    if (relayed_.load()) return relay_ && relay_->live();
     return control_ && control_->isOpen();
 }
 
 void Streamer::sendControl(const std::string& text) {
+    if (relayed_.load()) {
+        if (relay_) relay_->sendControl(text);
+        return;
+    }
     if (!control_ || !control_->isOpen()) return;
     try {
         control_->send(text);
@@ -523,6 +631,18 @@ void Streamer::handleControlMessage(const std::string& text) {
 
 StreamStats Streamer::stats() const {
     StreamStats s;
+    if (relayed_.load() && relay_) {
+        const auto r = relay_->stats();
+        s.framesSent        = r.framesSent;
+        s.bytesSent         = r.bytesSent;
+        s.framesDropped     = r.framesDropped;
+        s.targetBitrateKbps = r.kbps;
+        s.relaySendMs       = r.sendMs;
+        s.viewerBacklog     = r.viewerQueue;
+        s.pliCount          = pliCount_.load();
+        s.relayed           = true;
+        return s;
+    }
     s.framesSent        = framesSent_.load();
     s.bytesSent         = bytesSent_.load();
     s.keyframesSent     = keyframes_.load();

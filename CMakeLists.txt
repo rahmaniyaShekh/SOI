@@ -9,7 +9,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum macOS version")
 endif()
 
-project(soi-share LANGUAGES CXX VERSION 1.1.0)
+project(soi-share LANGUAGES CXX VERSION 1.3.0)
 
 if(APPLE)
     enable_language(OBJCXX)
@@ -132,6 +132,8 @@ set(SOI_CORE_COMMON
     src/capture/CaptureFactory.cpp
     src/encode/ColorConvert.cpp
     src/encode/Quality.cpp
+    src/net/RelayFrame.cpp
+    src/net/RelayLink.cpp
     src/net/SignalBlob.cpp
     src/util/Crypto.cpp
     src/util/Json.cpp

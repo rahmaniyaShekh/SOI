@@ -302,6 +302,119 @@ const SDP = 'v=0\r\no=rtc 1 0 IN IP4 127.0.0.1\r\ns=-\r\n' +
             `delete ${del.status}, read back ${after.status}`);
   }
 
+  // --- relay ------------------------------------------------------------------
+  //
+  // For network pairs with no direct path, host and viewer each hold a
+  // WebSocket on the room, paired by session, and the room forwards every
+  // message to the other side. What it forwards is sealed with a key it never
+  // sees; these check the plumbing.
+  {
+    const health = await fetch(`${BASE}/api/health`);
+    const hj = health.ok ? await health.json() : {};
+    hj.ok && hj.service === 'soi' ? ok('health endpoint') : bad('health endpoint', `status ${health.status}`);
+
+    const csp = page.headers.get('content-security-policy') || '';
+    // wrangler dev reports the custom domain as the host, so only the shape
+    // of the rule is checked here.
+    /connect-src 'self' wss:\/\/[a-z0-9.:-]+;/.test(csp)
+      ? ok('the page may open the relay WebSocket (CSP)')
+      : bad('the page may open the relay WebSocket (CSP)', csp);
+
+    const hex = n => [...crypto.getRandomValues(new Uint8Array(n))]
+      .map(b => b.toString(16).padStart(2, '0')).join('');
+    const rcode = makeCode(), rid = await roomIdFor(rcode);
+    const owner = hex(16), rs = makeSession();
+    const pub = await fetch(`${BASE}/api/room`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: rid, session: rs, offer: await seal(SDP, rcode), owner,
+                             caps: ['relay', 'teleport'] }),
+    });
+    const got = await (await fetch(`${BASE}/api/room/${rid}`)).json();
+    pub.status === 201 && JSON.stringify(got.caps) === '["relay"]'
+      ? ok('caps round trip, unknown abilities dropped', JSON.stringify(got.caps))
+      : bad('caps round trip', `status ${pub.status}, caps ${JSON.stringify(got.caps)}`);
+
+    // An old host: no owner, no caps. Still publishes; advertises nothing.
+    const oldCode = makeCode(), oldId = await roomIdFor(oldCode);
+    await fetch(`${BASE}/api/room`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: oldId, session: makeSession(), offer: await seal(SDP, oldCode) }),
+    });
+    const oldGot = await (await fetch(`${BASE}/api/room/${oldId}`)).json();
+    Array.isArray(oldGot.caps) && oldGot.caps.length === 0 && oldGot.offer
+      ? ok('a host that predates the relay still publishes, advertising nothing')
+      : bad('old host compatibility', JSON.stringify(oldGot));
+
+    const wsBase = BASE.replace(/^http/, 'ws');
+    const relayUrl = (role, s, o) =>
+      `${wsBase}/api/room/${rid}/relay?session=${s}&role=${role}${o ? `&owner=${o}` : ''}`;
+    // Resolves with an open socket, or null if the upgrade is refused.
+    const connect = url => new Promise(resolve => {
+      const ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
+      const t = setTimeout(() => { try { ws.close(); } catch {} resolve(null); }, 10000);
+      ws.onopen = () => { clearTimeout(t); resolve(ws); };
+      ws.onerror = () => { clearTimeout(t); resolve(null); };
+    });
+    const nextMessage = (ws, ms = 5000) => new Promise(resolve => {
+      const t = setTimeout(() => resolve(null), ms);
+      ws.onmessage = ev => { clearTimeout(t); resolve(ev.data); };
+    });
+    const closed = (ws, ms = 5000) => new Promise(resolve => {
+      const t = setTimeout(() => resolve(null), ms);
+      ws.onclose = ev => { clearTimeout(t); resolve(ev.code); };
+    });
+
+    const noOwner = await connect(relayUrl('host', rs));
+    const wrongOwner = await connect(relayUrl('host', rs, hex(16)));
+    !noOwner && !wrongOwner
+      ? ok('the host role is refused without the owner secret')
+      : bad('the host role is refused without the owner secret');
+    try { noOwner && noOwner.close(); wrongOwner && wrongOwner.close(); } catch {}
+
+    const stale = await connect(relayUrl('viewer', makeSession()));
+    !stale ? ok('a viewer for a session the host replaced is refused')
+           : bad('a viewer for a stale session is refused');
+    try { stale && stale.close(); } catch {}
+
+    const host = await connect(relayUrl('host', rs, owner));
+    const viewer = await connect(relayUrl('viewer', rs));
+    host && viewer ? ok('host and viewer pair on the session')
+                   : bad('host and viewer pair on the session', `host ${!!host}, viewer ${!!viewer}`);
+
+    if (host && viewer) {
+      const frame = new Uint8Array(require('node:crypto').randomBytes(200 * 1024));   // keyframe-sized
+      const toViewer = nextMessage(viewer);
+      host.send(frame);
+      const a = await toViewer;
+      a && Buffer.compare(Buffer.from(a), Buffer.from(frame)) === 0
+        ? ok('host -> viewer forwarded verbatim', `${frame.length} bytes`)
+        : bad('host -> viewer forwarded verbatim', a ? `${a.byteLength} bytes` : 'nothing arrived');
+
+      const ctl = crypto.getRandomValues(new Uint8Array(64));
+      const toHost = nextMessage(host);
+      viewer.send(ctl);
+      const b = await toHost;
+      b && Buffer.compare(Buffer.from(b), Buffer.from(ctl)) === 0
+        ? ok('viewer -> host forwarded verbatim')
+        : bad('viewer -> host forwarded verbatim');
+
+      // The keepalive is answered by the room itself and never reaches the peer.
+      const pong = nextMessage(host);
+      const leaked = nextMessage(viewer, 1500);
+      host.send('ping');
+      (await pong) === 'pong' && (await leaked) === null
+        ? ok('keepalive is answered by the room, not forwarded')
+        : bad('keepalive is answered by the room, not forwarded');
+
+      const viewerClosed = closed(viewer);
+      host.close(1000);
+      const code = await viewerClosed;
+      code !== null ? ok('the host leaving closes the viewer', `code ${code}`)
+                    : bad('the host leaving closes the viewer', 'viewer stayed open');
+    }
+  }
+
   // --- unknown code ---------------------------------------------------------
   const unknown = await fetch(`${BASE}/api/room/${await roomIdFor(makeCode())}`);
   unknown.status === 404 ? ok('unknown code returns 404')

@@ -25,6 +25,7 @@
 #include "encode/H264Encoder.h"
 #include "encode/Quality.h"
 #include "gpu/GpuPipeline.h"
+#include "net/RelayFrame.h"
 #include "net/SignalBlob.h"
 #include "net/Streamer.h"
 #include "util/Log.h"
@@ -76,6 +77,41 @@ std::atomic<bool> g_running{true};
 // True for `start --foreground` in a terminal: the join instructions are
 // printed there as well as the log. False for the detached background copy.
 bool g_attached = false;
+
+// How joins have gone this run, for `status`. A join that never connects is
+// counted apart from one that streamed and then dropped, with the real reason,
+// so a viewer stuck on "Connecting" is visible from this end too.
+struct JoinTally {
+    int         connected = 0, relayed = 0, failed = 0, dropped = 0;
+    std::string lastFailure;
+} g_joins;
+
+// Set when the last attempt ended because a viewer answered but no connection
+// formed. That is nobody's fault and the viewer is retrying right now, so the
+// next offer goes up promptly instead of after a growing backoff.
+bool g_joinFailed = false;
+
+void publishJoins() {
+    std::string text = soi::format("{} connected ({} relayed), {} dropped, {} never connected",
+                                   g_joins.connected, g_joins.relayed, g_joins.dropped,
+                                   g_joins.failed);
+    if (!g_joins.lastFailure.empty()) text += " -- last: " + g_joins.lastFailure;
+    setLive("joins", text);
+}
+void noteJoinFailed(const std::string& why) {
+    ++g_joins.failed;
+    g_joins.lastFailure = why;
+    publishJoins();
+}
+void noteJoinConnected(bool relayed) {
+    ++g_joins.connected;
+    if (relayed) ++g_joins.relayed;
+    publishJoins();
+}
+void noteJoinDropped() {
+    ++g_joins.dropped;
+    publishJoins();
+}
 
 bool printJoinInfo(const std::map<std::string, std::string>& live);
 
@@ -1377,7 +1413,14 @@ private:
         return true;
     }
 
-    int cappedNominal() const { return std::clamp(opt_.fps, 1, level_->fps); }
+    // The relay caps the frame rate too: every frame is one WebSocket message,
+    // and the free plan's request budget is counted in messages.
+    int cappedNominal() const {
+        int cap = std::clamp(opt_.fps, 1, level_->fps);
+        if (const int transport = streamer_.frameRateCap(); transport > 0)
+            cap = std::min(cap, transport);
+        return cap;
+    }
 
     // What the encoder is allowed to spend. In quality-targeted mode this is a
     // ceiling the encoder usually stays well under on a static screen.
@@ -1539,14 +1582,21 @@ void runCaptureLoop(FrameSource& capture, QualityDirector& director, Streamer& s
             prevBytes  = s.bytesSent;
             prevFrames = s.framesSent;
 
-            const std::string line = soi::format(
-                "{} {}x{} [{}/{}] | {:.0f} kbps | {:.1f}/{:.1f} fps sent/cap (cap {}) | "
-                "{} static | loss {:.1f}% | rtt {:.0f} ms | link {} kbps{}",
+            const std::string head = soi::format(
+                "{} {}x{} [{}/{}] | {:.0f} kbps | {:.1f}/{:.1f} fps sent/cap (cap {}) | {} static",
                 director.level().name, director.encodeWidth(), director.encodeHeight(),
                 backendName(capture.backend()), director.onGpu() ? "gpu" : "cpu",
-                kbps, fpsTx, captured / secs, director.frameRate(), skipped,
-                s.lossFraction * 100.0, s.rttMs, s.targetBitrateKbps,
-                s.rembSeen ? " [remb]" : "");
+                kbps, fpsTx, captured / secs, director.frameRate(), skipped);
+            // Over the relay nothing is lost; what matters is whether the TCP
+            // path and the viewer's decoder are keeping up.
+            const std::string line = s.relayed
+                ? soi::format("{} | path relay | send {:.0f} ms | viewer backlog {} | "
+                              "dropped {} | target {} kbps",
+                              head, s.relaySendMs, s.viewerBacklog, s.framesDropped,
+                              s.targetBitrateKbps)
+                : soi::format("{} | path direct | loss {:.1f}% | rtt {:.0f} ms | link {} kbps{}",
+                              head, s.lossFraction * 100.0, s.rttMs, s.targetBitrateKbps,
+                              s.rembSeen ? " [remb]" : "");
 
             if (daemon) {
                 setLive("stats", line);
@@ -1692,8 +1742,11 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
     if (!streamer.start(netCfg)) return 1;
 
     setDaemonState(DaemonState::Gathering);
-    if (!streamer.waitForGathering(15s))
-        logW("ICE gathering did not complete in 15s; using what we have");
+    // Capped at 8s, and returns a second after the first public candidate, so a
+    // slow STUN server cannot delay the code. Interruptible, so a stop is not
+    // kept waiting either.
+    streamer.waitForGathering(8s, [] { return stopRequested() || !g_running.load(); });
+    if (stopRequested() || !g_running.load()) return 0;
 
     const std::string sdp = streamer.localDescriptionSdp();
     if (sdp.empty()) { logE("no local description was produced"); return 1; }
@@ -1854,44 +1907,127 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
         logE("could not read the answer: {}", error);
         return 1;
     }
-    if (!streamer.acceptAnswer(answerSdp, error)) {
+
+    // The viewer's page asks for the relay -- when its network cannot reach
+    // this one directly -- by sealing a relay key into the answer instead of
+    // an SDP. Only someone holding the code can produce one.
+    const bool canRelay = !liveCode.empty() && relaySupported();
+    bool relayed = false;
+    const auto startRelay = [&](RelayKey key) {
+        std::string why;
+        auto socket = openRelaySocket(opt.serviceUrl, roomId, sessionId, why);
+        if (!socket) {
+            logE("could not join the relay: {}", why);
+            return false;
+        }
+        streamer.startRelay(std::move(socket), std::move(key));
+        relayed = true;
+        setLive("path", "relayed through the rendezvous (end-to-end encrypted)");
+        return true;
+    };
+
+    clearLive("path");
+    if (RelayKey key; parseRelayRequest(answerSdp, key)) {
+        if (!canRelay) {
+            logE("the viewer asked for the relay, which this session cannot use");
+            recoverable = true;
+            return 1;
+        }
+        logI("the viewer's network cannot reach this one directly; relaying through "
+             "the rendezvous");
+        if (!startRelay(std::move(key))) {
+            recoverable = true;
+            return 1;
+        }
+    } else if (!streamer.acceptAnswer(answerSdp, error)) {
         logE("the answer was rejected: {}", error);
         return 1;
     }
 
     setDaemonState(DaemonState::Connecting);
     logI("connecting...");
-    // 15s, deliberately SHORTER than the viewer's 25s attempt timeout.
+    // 15s from the answer -- never from the offer, which can sit for an hour
+    // before anyone joins -- and deliberately SHORTER than the viewer's 25s
+    // attempt timeout.
     //
     // The ordering is the contract that makes reconnection converge: whoever
     // gives up first decides what happens next, and it has to be the sender,
     // because only the sender can publish a new offer. The viewer waits out its
     // own attempt, sees a NEW session id appear, and answers that instead of
     // re-answering the corpse of this one.
-    if (!streamer.waitForConnected(15s)) {
-        if (streamer.hasFailed())
+    //
+    // Meanwhile the session's answer slot is watched: a viewer whose checks get
+    // no reply gives up on the direct path after ~7s and sends a relay request
+    // on this same session, and switching to it here is what lets the picture
+    // appear in seconds rather than after a full retry cycle.
+    {
+        const auto stopping = [] { return stopRequested() || !g_running.load(); };
+        auto deadline = std::chrono::steady_clock::now() + 15s;
+        auto lastPoll = std::chrono::steady_clock::now();
+        while (!streamer.isConnected() && !stopping()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) break;
+            if (relayed && streamer.hasFailed()) break;   // the relay itself closed
+
+            if (!relayed && canRelay && now - lastPoll >= 1s) {
+                lastPoll = now;
+                std::string next, nextSdp, why;
+                RelayKey key;
+                if (pollAnswerOnce(opt.serviceUrl, roomId, sessionId, next).ok &&
+                    !next.empty() && next != answerBlob &&
+                    decodeSignalBlob(next, answerKey, nextSdp, why) &&
+                    parseRelayRequest(nextSdp, key)) {
+                    logI("the viewer could not reach this network directly; switching to "
+                         "the relay");
+                    if (!startRelay(std::move(key))) break;
+                    answerBlob = next;   // so the knock watcher does not take it for a new viewer
+                    deadline = std::chrono::steady_clock::now() + 15s;
+                }
+            }
+            std::this_thread::sleep_for(100ms);
+        }
+        if (stopping()) return 0;
+    }
+
+    if (!streamer.isConnected()) {
+        if (relayed) {
+            logE("the viewer did not join the relay within 15s");
+            noteJoinFailed("the viewer did not join the relay");
+        } else if (canRelay) {
+            logE("could not connect directly (no network path between the two "
+                 "networks); the viewer falls back to the relay");
+            noteJoinFailed("could not connect directly; the viewer falls back to the relay");
+        } else if (streamer.hasFailed()) {
             logE("ICE failed -- if this repeats, both peers are likely behind "
                  "symmetric NAT, which needs a TURN relay (see --turn)");
-        else
+            noteJoinFailed("could not connect directly (no network path)");
+        } else {
             logE("the viewer did not complete the handshake within 15s");
+            noteJoinFailed("the viewer did not complete the handshake");
+        }
 
         // Retryable: the viewer may simply have gone away mid-handshake, or be
-        // about to come back. Exiting here would strand the session.
+        // about to come back -- possibly through the relay. Exiting here would
+        // strand the session.
         recoverable = true;
+        g_joinFailed = true;
         return 1;
     }
 
     // What the viewer's decoder actually accepts, read from its answer rather
     // than assumed. Browsers answer with level 3.1 unless the page raises it,
     // and 3.1 stops at exactly 1280x720 -- so without reading this the sender
-    // happily encodes 1080p that the far end cannot properly decode.
-    const int peerLevel = h264LevelFromSdp(answerSdp);
+    // happily encodes 1080p that the far end cannot properly decode. A relayed
+    // viewer decodes with WebCodecs, which has no negotiated level to honour.
+    const int peerLevel = relayed ? 0 : h264LevelFromSdp(answerSdp);
     const int peerMaxMbs = maxFrameMacroblocksForLevel(peerLevel);
     if (peerLevel)
         logI("viewer decodes up to H.264 level {}.{} ({} macroblocks per frame)",
              peerLevel / 10, peerLevel % 10, peerMaxMbs ? peerMaxMbs : 0);
-    else
+    else if (!relayed)
         logW("the viewer's answer states no H.264 level; not constraining resolution");
+    if (!relayed) setLive("path", "direct (peer to peer)");
+    noteJoinConnected(relayed);
 
     // The director owns the encoder from here on, because changing quality means
     // rebuilding it.
@@ -1995,6 +2131,7 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
     // operator stopped us": only the first two should re-offer the code.
     recoverable = g_running.load() && !stopRequested();
     if (handingOver) logI("session ended to let a viewer rejoin");
+    else if (recoverable) noteJoinDropped();
 
     setDaemonState(DaemonState::Stopping);
     handover.stop();
@@ -2093,6 +2230,7 @@ int runSession(const Options& opt, bool daemon) {
 
     for (int attempt = 1; g_running.load() && !stopRequested(); ++attempt) {
         bool recoverable = false;
+        g_joinFailed = false;
         const int rc = runOneSession(opt, daemon, shareCode, roomId, recoverable);
 
         if (!g_running.load() || stopRequested()) return 0;
@@ -2112,6 +2250,10 @@ int runSession(const Options& opt, bool daemon) {
         // failure starts from a short delay again. Without this reset a long
         // session followed by a blip inherits a 15s wait for no reason.
         if (rc == 0 && recoverable) backoffSeconds = 2;
+        // A viewer answered but no connection formed. It is retrying right now
+        // (through the relay, if this build offers one), so the next offer has
+        // to be there promptly: no growing backoff for that.
+        if (g_joinFailed) backoffSeconds = 1;
 
         // Back off gently so a long outage does not hammer the rendezvous,
         // but stay responsive when the network returns quickly.
@@ -2119,7 +2261,7 @@ int runSession(const Options& opt, bool daemon) {
             if (!g_running.load() || stopRequested()) return 0;
             std::this_thread::sleep_for(100ms);
         }
-        backoffSeconds = std::min(backoffSeconds * 2, 15);
+        backoffSeconds = g_joinFailed ? 2 : std::min(backoffSeconds * 2, 15);
     }
     return 0;
 }
@@ -2484,6 +2626,10 @@ int cmdStatus() {
         std::printf("  on LAN   %s\n", urls.substr(0, urls.find(' ')).c_str());
     if (const auto stats = get("stats"); !stats.empty() && state == DaemonState::Streaming)
         std::printf("  stream   %s\n", stats.c_str());
+    if (const auto path = get("path"); !path.empty() && state == DaemonState::Streaming)
+        std::printf("  path     %s\n", path.c_str());
+    if (const auto joins = get("joins"); !joins.empty())
+        std::printf("  joins    %s\n", joins.c_str());
     std::printf("  exe      %s\n", get("exe").c_str());
     std::printf("  log      %s\n", get("log").c_str());
     return 0;

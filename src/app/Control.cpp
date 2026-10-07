@@ -12,6 +12,7 @@
   #include <csignal>
   #include <cstdlib>
   #include <sys/wait.h>
+  #include <unistd.h>
   #if defined(__APPLE__)
     #include <libproc.h>
   #endif
@@ -65,6 +66,29 @@ std::map<std::string, std::string> statusReply() {
     return kv;
 }
 
+// A stop has to finish. Every wait in the session checks for it, but a network
+// call already in flight can hold the exit for its whole timeout, and before
+// this a stuck stop needed `stop --force`. If the clean shutdown has not
+// finished after this long, the process ends anyway -- removing its instance
+// record first, so `status` does not report a copy that is gone.
+constexpr auto kStopWatchdog = std::chrono::seconds(4);
+
+void armStopWatchdog() {
+    static std::atomic<bool> armed{false};
+    if (armed.exchange(true)) return;
+    std::thread([] {
+        std::this_thread::sleep_for(kStopWatchdog);
+        logW("clean shutdown did not finish within {} s; exiting now",
+             std::chrono::duration_cast<std::chrono::seconds>(kStopWatchdog).count());
+        removeStateFile(kInstanceFile);
+#if defined(_WIN32)
+        ExitProcess(0);
+#else
+        _exit(0);
+#endif
+    }).detach();
+}
+
 void handleClient(SOCKET client) {
     setSocketTimeouts(client, 2000);
 
@@ -98,6 +122,7 @@ void handleClient(SOCKET client) {
     } else if (command == "stop") {
         logI("stop requested over the control channel");
         requestStop();
+        armStopWatchdog();
         reply["ok"] = "1";
     } else if (command == "answer") {
         if (arg.empty()) {

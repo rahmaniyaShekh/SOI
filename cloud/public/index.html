@@ -6,7 +6,7 @@
 <!-- The real policy is sent as a header by the Worker (frame-ancestors only
      works there). This copy keeps the page locked down when it is opened
      straight off disk, where there are no headers. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src 'self'; media-src blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src 'self' wss:; media-src blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
 <title>Join a screen share</title>
 <style>
   /* Two screens: join, and watch. Nothing else belongs here. */
@@ -67,10 +67,10 @@
      background, overlay or text. It is a live screen; anything drawn on top of
      it is in the way. Controls live in the strip below, outside this element. */
   #screen{display:block}
-  #screen video{display:block;width:100%;height:auto}
+  #screen video,#screen canvas{display:block;width:100%;height:auto}
 
   #screen:fullscreen{width:100%;height:100%;display:flex}
-  #screen:fullscreen video{width:100%;height:100%;object-fit:contain}
+  #screen:fullscreen video,#screen:fullscreen canvas{width:100%;height:100%;object-fit:contain}
 
   #strip{display:flex;align-items:center;gap:1rem;flex-wrap:wrap;
          padding:.75rem 1rem;font-size:.8125rem;color:var(--muted)}
@@ -110,12 +110,14 @@
   <p class="hint">
     The code never reaches this website. Your browser hashes it to find the room
     and decrypts the connection details locally, so the server only stores data
-    it cannot read. Video flows directly between the two devices.
+    it cannot read. Video flows directly between the two devices, or, when the
+    two networks cannot reach each other, through this website end-to-end
+    encrypted with a key only the two devices have.
   </p>
 </main>
 
 <div id="watch" hidden>
-  <div id="screen"><video id="video" autoplay playsinline></video></div>
+  <div id="screen"><video id="video" autoplay playsinline></video><canvas id="canvas" hidden></canvas></div>
   <div id="strip">
     <span id="live" role="status"></span>
     <span id="stats"></span>
@@ -203,7 +205,7 @@ async function decodeBlob(blob,pass){
 const $=id=>document.getElementById(id);
 const el={join:$('join'),watch:$('watch'),saved:$('saved'),code:$('code'),
           nameWrap:$('nameWrap'),name:$('name'),connect:$('connect'),error:$('error'),
-          joinStatus:$('joinStatus'),screen:$('screen'),video:$('video'),live:$('live'),
+          joinStatus:$('joinStatus'),screen:$('screen'),video:$('video'),canvas:$('canvas'),live:$('live'),
           stats:$('stats'),full:$('full'),leave:$('leave'),
           qualityWrap:$('qualityWrap'),quality:$('quality'),
           screenWrap:$('screenWrap'),monitor:$('monitor')};
@@ -327,6 +329,8 @@ function stopSession(){
   stopped=true;
   if(statsTimer){ clearInterval(statsTimer); statsTimer=null; }
   control=null;
+  relayClose();
+  netHint='';
   showQuality(null);
   releaseWake();
 }
@@ -344,6 +348,7 @@ document.addEventListener('visibilitychange',()=>{
 function showJoin(message){
   el.join.hidden=false; el.watch.hidden=true;
   el.video.srcObject=null;
+  showSurface('video');
   el.live.textContent='';
   el.joinStatus.textContent='';   // the outcome replaces the progress note
   el.stats.textContent='';
@@ -352,6 +357,8 @@ function showJoin(message){
   refreshNamePrompt();
 }
 function showWatch(){ el.join.hidden=true; el.watch.hidden=false; }
+// The direct path plays a <video>; the relay decodes into a <canvas>.
+function showSurface(which){ el.video.hidden=which!=='video'; el.canvas.hidden=which!=='canvas'; }
 
 function start(code,name){
   stopSession();
@@ -384,6 +391,10 @@ async function driver(code,pendingName,known,gen){
   const spent=new Map();
   let everConnected=false;
   let waitingSince=Date.now();
+  // Once this tab has needed the relay for this sender, reconnects go straight
+  // to it. Two relay failures in a row and it tries direct again: networks
+  // change.
+  let useRelay=stickyRelay(code), relayFails=0, failedInARow=0;
 
   while(gen===generation){
     let room=null;
@@ -426,15 +437,46 @@ async function driver(code,pendingName,known,gen){
       continue;
     }
 
-    const outcome=await attempt(id,code,room,gen,()=>{
+    // The relay is only tried when the sender says it can do it: a sender
+    // that predates it would never join.
+    const canRelay=(room.caps||[]).includes('relay')&&relaySupported();
+    const viaRelay=useRelay&&canRelay;
+    const onLive=()=>{
       // Fires the moment real frames arrive, not when the session later ends.
       everConnected=true; known=true;
+      netHint=''; failedInARow=0;
       rememberScreen(code,pendingName);
       pendingName='';
-    });
+    };
+    const outcome=viaRelay
+      ? await relayAttempt(id,code,room,gen,onLive)
+      : await attempt(id,code,room,gen,onLive,canRelay);
     if(gen!==generation) return;
 
     if(outcome==='badcode'){ stopped=true; showJoin(lastError); return; }
+
+    // The two networks cannot reach each other directly: the sender is still
+    // listening on this very session, so ask it for the relay right away
+    // rather than waiting for a fresh offer.
+    if(outcome==='nopath'){ useRelay=true; continue; }
+
+    const failed=outcome==='failed'||outcome==='timeout';
+    failedInARow=failed?failedInARow+1:0;
+    if(viaRelay&&failed&&++relayFails>=2){
+      useRelay=false; relayFails=0;
+      setStickyRelay(code,false);
+    }
+    if(viaRelay&&outcome==='connected') relayFails=0;
+    // Answered but never connected, twice, and no relay on offer: say why
+    // instead of an endless "Connecting".
+    if(failedInARow>=2&&!canRelay){
+      const who=(findSaved(code)||{}).name||'the sharing PC';
+      netHint=(room.caps||[]).includes('relay')
+        ? `Your network can't reach ${who} directly, and this browser cannot use the `+
+          'relay. Try a current Chrome, Edge or Firefox.'
+        : `Your network can't reach ${who} directly. Ask them to update soi-share `+
+          'so the stream can be relayed.';
+    }
 
     // 'stale' means the sender replaced the offer before it read our answer, so
     // the session was never consumed and the next one is already waiting.
@@ -455,7 +497,7 @@ async function getOffer(id){
 }
 
 // One handshake. Owns its peer connection start to finish; returns why it ended.
-async function attempt(id,code,room,gen,onLive){
+async function attempt(id,code,room,gen,onLive,canRelay){
   let sdp;
   try{ sdp=await decodeBlob(room.offer,code); }
   catch(err){ lastError=err.message; return 'badcode'; }
@@ -479,6 +521,7 @@ async function attempt(id,code,room,gen,onLive){
   pc.ontrack=ev=>{
     el.video.srcObject=ev.streams[0]||new MediaStream([ev.track]);
     streaming=true;
+    showSurface('video');
     showWatch();
     setLive('connected');
     requestWake();
@@ -520,12 +563,24 @@ async function attempt(id,code,room,gen,onLive){
     setLive(streaming?'reconnecting':'connecting');
 
     const timer=setTimeout(()=>done.resolve('timeout'),ATTEMPT_TIMEOUT);
+    const posted=Date.now();
+    let probing=false;
     // Resolve as soon as media actually arrives, not merely when ICE says it
     // connected: decoded frames are the only proof the path really works.
     // Gated on this attempt's own ontrack, because until that fires the element
     // still holds the PREVIOUS session's stream and would report a stale size.
+    //
+    // And give up on the direct path early when it cannot work. Seven seconds
+    // of connectivity checks without a single reply means the two networks
+    // cannot reach each other at all -- measured: a carrier-grade NAT that
+    // picks a new port per destination, facing a router that drops packets
+    // from unexpected ports. Waiting out the full timeout would change nothing.
     const watch=setInterval(()=>{
       if(streaming&&el.video.videoWidth>0) done.resolve('connected');
+      if(canRelay&&!probing&&Date.now()-posted>NOPATH_AFTER){
+        probing=true;
+        noPath(pc).then(stuck=>{ probing=false; if(stuck) done.resolve('nopath'); });
+      }
     },250);
 
     // Watch for the sender replacing the offer under us. It does that whenever
@@ -562,11 +617,242 @@ async function attempt(id,code,room,gen,onLive){
     }
 
     pc.close();
-    return 'failed';
+    return why==='nopath'?'nopath':'failed';
   }catch(err){
     try{ pc.close() }catch{}
     return 'failed';
   }
+}
+
+// True when ICE has been sending connectivity checks and not one has been
+// answered: no direct path exists between these two networks.
+const NOPATH_AFTER=7000;
+async function noPath(pc){
+  try{
+    if(pc.iceConnectionState==='connected'||pc.iceConnectionState==='completed') return false;
+    let sent=0,answered=0;
+    (await pc.getStats()).forEach(r=>{
+      if(r.type==='candidate-pair'){ sent+=r.requestsSent||0; answered+=r.responsesReceived||0; }
+    });
+    return sent>10&&answered===0&&pc.iceConnectionState!=='connected';
+  }catch{ return false }
+}
+
+// --- relay: through this website when no direct path exists ------------------
+// The page puts a fresh AES-256-GCM key inside its code-sealed answer; the
+// sender opens it and both join a WebSocket pair on the server, which forwards
+// ciphertext it cannot read. Every message is
+//   iv(12) | AES-GCM( type(1) | payload ) | tag(16)
+// type 1 carries H.264 access units from the sender, each
+//   flags(1, bit 0 = keyframe) | timestamp ms (u32) | length (u32) | Annex B
+// and type 2 carries the same control JSON the data channel does. Video is
+// decoded here with WebCodecs and drawn into a canvas in the video's place.
+//
+// The path is TCP, so nothing is lost; what can happen is falling behind. If
+// the decoder backs up, delta frames are dropped until the next keyframe and
+// one is asked for, and the backlog is reported so the sender slows down.
+const RELAY_STORE='soi.relay.';
+const relaySupported=()=>'VideoDecoder' in window&&'EncodedVideoChunk' in window&&'WebSocket' in window;
+const stickyRelay=code=>{ try{ return sessionStorage.getItem(RELAY_STORE+code)==='1' }catch{ return false } };
+const setStickyRelay=(code,on)=>{
+  try{ on?sessionStorage.setItem(RELAY_STORE+code,'1'):sessionStorage.removeItem(RELAY_STORE+code) }catch{}
+};
+const MAX_DECODE_BACKLOG=4;
+let relay=null;   // the live relay, when there is one
+
+function relaySend(type,payload){
+  const R=relay;
+  if(!R||!R.ws||R.ws.readyState!==1) return false;
+  const plain=new Uint8Array(payload.length+1);
+  plain[0]=type; plain.set(payload,1);
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  // Chained, so messages leave in the order they were sent.
+  R.out=R.out.then(()=>crypto.subtle.encrypt({name:'AES-GCM',iv},R.key,plain))
+    .then(ct=>{ if(R.ws.readyState===1) R.ws.send(concat(iv,new Uint8Array(ct))); })
+    .catch(()=>{});
+  return true;
+}
+
+function relayClose(){
+  const R=relay;
+  if(!R) return;
+  relay=null;
+  clearInterval(R.hello); clearInterval(R.reporter);
+  try{ R.ws&&R.ws.close() }catch{}
+  try{ R.decoder&&R.decoder.state!=='closed'&&R.decoder.close() }catch{}
+}
+
+// avc1.PPCCLL from the SPS in an Annex B keyframe, so the decoder is configured
+// for exactly what the sender's encoder produces.
+function avcCodec(data){
+  const hex=b=>b.toString(16).padStart(2,'0');
+  for(let i=0;i+6<data.length;i++){
+    if(data[i]===0&&data[i+1]===0&&data[i+2]===1&&(data[i+3]&0x1f)===7)
+      return 'avc1.'+hex(data[i+4])+hex(data[i+5])+hex(data[i+6]);
+  }
+  return '';
+}
+
+async function relayAttempt(id,code,room,gen,onLive){
+  setLive('connecting through the relay');
+  const raw=crypto.getRandomValues(new Uint8Array(32));
+  let post;
+  try{
+    const answer=await encodeBlob(JSON.stringify({relay:1,key:b64urlEncode(raw)}),code);
+    if(gen!==generation) return 'aborted';
+    post=await fetch(`/api/room/${id}/answer`,{
+      method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({answer,session:room.session}),
+    });
+  }catch{ return 'failed' }
+  if(gen!==generation) return 'aborted';
+  if(post.status===409) return 'stale';
+  if(!post.ok) return 'failed';
+
+  const key=await crypto.subtle.importKey('raw',raw,'AES-GCM',false,['encrypt','decrypt']);
+  const done=deferred();
+  const R={ws:null,key,out:Promise.resolve(),chain:Promise.resolve(),decoder:null,codec:'',
+           waitKey:true,frames:0,bytes:0,dropped:0,lastAsk:0,lastReport:0,heard:false,
+           w:0,h:0,hello:0,reporter:0,ctx:el.canvas.getContext('2d')};
+  relayClose();
+  relay=R; control=null;
+
+  const askKeyframe=()=>{
+    const now=performance.now();
+    if(now-R.lastAsk<1000) return;
+    R.lastAsk=now;
+    sendControl({type:'keyframe'});
+  };
+  const report=()=>{
+    R.lastReport=performance.now();
+    sendControl({type:'rx',q:R.decoder?R.decoder.decodeQueueSize:0,drop:R.dropped});
+  };
+  const newDecoder=()=>{
+    try{ R.decoder&&R.decoder.state!=='closed'&&R.decoder.close() }catch{}
+    R.codec=''; R.waitKey=true;
+    R.decoder=new VideoDecoder({
+      output:frame=>{
+        try{
+          if(relay!==R) return;
+          const w=frame.displayWidth,h=frame.displayHeight;
+          if(el.canvas.width!==w||el.canvas.height!==h){ el.canvas.width=w; el.canvas.height=h; }
+          R.ctx.drawImage(frame,0,0,w,h);
+          R.w=w; R.h=h; R.frames++;
+        }finally{ frame.close() }
+      },
+      // A decoder error is unrecoverable for that decoder: start a fresh one
+      // from the next keyframe.
+      error:()=>{ if(relay!==R) return; R.dropped++; newDecoder(); askKeyframe(); },
+    });
+  };
+  newDecoder();
+
+  const decodeFrame=async(isKey,ts,data)=>{
+    if(isKey){
+      const codec=avcCodec(data)||R.codec;
+      if(!codec){ R.dropped++; return; }
+      if(codec!==R.codec||R.decoder.state!=='configured'){
+        const cfg={codec,optimizeForLatency:true};
+        let ok=false;
+        try{ ok=(await VideoDecoder.isConfigSupported(cfg)).supported }catch{}
+        if(relay!==R) return;
+        if(!ok){ netHint='This browser cannot decode the relayed stream. Try Chrome or Edge.'; done.resolve('failed'); return; }
+        if(R.decoder.state==='closed') newDecoder();
+        R.decoder.configure(cfg);
+        R.codec=codec;
+      }
+      R.waitKey=false;
+    }else{
+      // The decoder cannot resume from a gap, and a backlog only grows: skip
+      // to the next keyframe and ask for it.
+      if(R.waitKey||R.decoder.state!=='configured'){ R.dropped++; askKeyframe(); return; }
+      if(R.decoder.decodeQueueSize>MAX_DECODE_BACKLOG){
+        R.waitKey=true; R.dropped++; askKeyframe(); report(); return;
+      }
+    }
+    try{
+      R.decoder.decode(new EncodedVideoChunk({type:isKey?'key':'delta',timestamp:ts*1000,data}));
+    }catch{ R.dropped++; newDecoder(); askKeyframe(); }
+  };
+
+  const handle=async buf=>{
+    const b=new Uint8Array(buf);
+    if(b.length<29) return;
+    let plain;
+    try{ plain=new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:b.subarray(0,12)},key,b.subarray(12))) }
+    catch{ return }   // not sealed with this attempt's key
+    if(relay!==R) return;
+    R.bytes+=b.length; R.heard=true;
+    if(plain[0]===1){
+      const p=plain.subarray(1);
+      for(let off=0;off+9<=p.length;){
+        const isKey=(p[off]&1)===1;
+        const ts=((p[off+1]<<24)|(p[off+2]<<16)|(p[off+3]<<8)|p[off+4])>>>0;
+        const len=((p[off+5]<<24)|(p[off+6]<<16)|(p[off+7]<<8)|p[off+8])>>>0;
+        off+=9;
+        if(off+len>p.length) break;
+        await decodeFrame(isKey,ts,p.subarray(off,off+len));
+        off+=len;
+      }
+    }else if(plain[0]===2){
+      let m; try{ m=JSON.parse(new TextDecoder().decode(plain.subarray(1))) }catch{ return }
+      onControl(m,code);
+    }
+    // Network events are not throttled in a background tab the way timers
+    // are, so the report rides on incoming frames too.
+    if(performance.now()-R.lastReport>1000) report();
+  };
+
+  const ws=new WebSocket(`${location.origin.replace(/^http/,'ws')}/api/room/${id}/relay?session=${room.session}&role=viewer`);
+  ws.binaryType='arraybuffer';
+  R.ws=ws;
+  // WebCrypto promises are not guaranteed to resolve in order: chain them so
+  // frames reach the decoder in the order they arrived.
+  ws.onmessage=ev=>{ if(typeof ev.data!=='string') R.chain=R.chain.then(()=>handle(ev.data)); };
+  ws.onclose=()=>done.resolve(R.frames?'dropped':'failed');
+  ws.onopen=()=>{
+    // Say hello until the sender answers: it may join the relay after us.
+    sendControl({type:'hello'});
+    R.hello=setInterval(()=>{ if(R.heard) clearInterval(R.hello); else sendControl({type:'hello'}); },1000);
+  };
+  R.reporter=setInterval(report,1000);
+
+  const timer=setTimeout(()=>done.resolve('timeout'),ATTEMPT_TIMEOUT);
+  const watch=setInterval(()=>{
+    if(gen!==generation) return done.resolve('aborted');
+    if(R.frames>0) done.resolve('connected');
+    else if(R.heard) setLive('starting the picture (relayed)');
+  },250);
+  // The sender replaced the offer: it gave up on this session.
+  const supersede=setInterval(async()=>{
+    try{
+      const now=await getOffer(id);
+      if(!now||now.session!==room.session) done.resolve('stale');
+    }catch{}
+  },2000);
+
+  let why=await done.promise;
+  clearTimeout(timer); clearInterval(watch); clearInterval(supersede);
+  if(gen!==generation){ if(relay===R) relayClose(); return 'aborted'; }
+  if(why!=='connected'){ if(relay===R) relayClose(); return why; }
+
+  setStickyRelay(code,true);
+  onLive&&onLive();
+  showSurface('canvas');
+  showWatch();
+  setLive('connected · relayed');
+  requestWake();
+  startRelayStats(R,gen);
+  // Stay here until the relay ends; the handlers above now report the drop.
+  const ended=deferred();
+  ws.onclose=()=>ended.resolve();
+  if(ws.readyState>=2) ended.resolve();
+  await ended.promise;
+  if(relay===R) relayClose();
+  if(gen!==generation) return 'aborted';
+  showQuality(null);
+  setLive('reconnecting');
+  return 'connected';
 }
 
 function deferred(){
@@ -632,6 +918,7 @@ function rememberQuality(code,level){
 }
 
 function sendControl(msg){
+  if(relay) return relaySend(2,new TextEncoder().encode(JSON.stringify(msg)));
   if(control&&control.readyState==='open'){
     try{ control.send(JSON.stringify(msg)); return true }catch{}
   }
@@ -725,9 +1012,11 @@ el.monitor.onchange=()=>{
 // --- the strip (everything that is not video) -------------------------------
 // Progress belongs wherever the person is looking: the strip once the video is
 // up, and the join screen before that. Never over the picture.
+let netHint='';   // why a join keeps failing, when that is known
 function setLive(text){
   el.live.textContent=text;
-  el.joinStatus.textContent=el.join.hidden?'':(text?text.charAt(0).toUpperCase()+text.slice(1)+'…':'');
+  const line=text?text.charAt(0).toUpperCase()+text.slice(1)+'…':'';
+  el.joinStatus.textContent=el.join.hidden?'':(netHint&&line?line+' '+netHint:line);
 }
 
 let statsTimer=null;
@@ -767,6 +1056,26 @@ function startStats(pc,gen){
   statsTimer=tick;
 }
 
+function startRelayStats(R,gen){
+  if(statsTimer) clearInterval(statsTimer);
+  let prevFrames=R.frames, prevBytes=R.bytes, prevT=performance.now();
+  const tick=setInterval(()=>{
+    if(gen!==generation||relay!==R){
+      clearInterval(tick);
+      if(statsTimer===tick){ statsTimer=null; el.stats.textContent=''; }
+      return;
+    }
+    const now=performance.now(), dt=(now-prevT)/1000;
+    if(dt<=0) return;
+    el.stats.textContent=[`${R.w}×${R.h}`,
+      `${((R.frames-prevFrames)/dt).toFixed(0)} fps`,
+      `${Math.round((R.bytes-prevBytes)*8/1000/dt)} kb/s`,
+      'relayed'].join(' · ');
+    prevFrames=R.frames; prevBytes=R.bytes; prevT=now;
+  },1000);
+  statsTimer=tick;
+}
+
 el.full.onclick=()=>{
   if(document.fullscreenElement){ document.exitFullscreen(); return; }
   // Fullscreen the container, which holds the video and nothing else, so there
@@ -784,6 +1093,9 @@ el.leave.onclick=()=>{
   showJoin('');
   el.code.focus();
 };
+
+// For automated end-to-end checks: read-only views of the live session.
+window.__soi={get relay(){ return relay }, get control(){ return control }};
 
 // --- entry ------------------------------------------------------------------
 renderSaved();

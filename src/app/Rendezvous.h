@@ -21,7 +21,10 @@
 // This is therefore a rendezvous, not a signalling server in the usual sense:
 // it relays bytes it cannot interpret.
 //
+#include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 
 namespace soi {
@@ -50,11 +53,26 @@ struct RendezvousResult {
     std::string error;
 };
 
+// A random secret generated once per process and sent with every publish. The
+// rendezvous keeps only its hash, and only the holder may join the relay for
+// this room as the host.
+const std::string& hostOwnerToken();
+
+// Whether this build can carry a session over the rendezvous relay when the
+// two networks cannot reach each other directly. Advertised on publish as
+// caps:["relay"]; a viewer only asks for the relay when it is advertised.
+bool relaySupported();
+
 // Publishes the sealed offer under SHA-256(code). `baseUrl` is like
 // "https://share.mdarif.online".
 RendezvousResult publishOffer(const std::string& baseUrl, const std::string& roomId,
                               const std::string& sessionId,
                               const std::string& sealedOffer);
+
+// One look for an answer to `sessionId`, without waiting. ok with an empty
+// answer means nothing has arrived yet.
+RendezvousResult pollAnswerOnce(const std::string& baseUrl, const std::string& roomId,
+                                const std::string& sessionId, std::string& sealedAnswer);
 
 // Polls for the viewer's sealed answer. Returns ok=false with an empty answer
 // (and empty error) when the timeout elapses with nobody having joined.
@@ -71,5 +89,24 @@ RendezvousResult waitForAnswer(const std::string& baseUrl, const std::string& ro
 // room's 10-minute expiry, and a viewer answers it over and over -- each try
 // costing a full ICE timeout. Best effort: failing to clean up is not fatal.
 RendezvousResult closeRoom(const std::string& baseUrl, const std::string& roomId);
+
+// A WebSocket to the rendezvous relay. send* and receive may be called from
+// different threads; close() unblocks both and may be called from any thread.
+class RelaySocket {
+public:
+    virtual ~RelaySocket() = default;
+    virtual bool sendBinary(const uint8_t* data, size_t len) = 0;
+    virtual bool sendText(const std::string& text) = 0;
+    // Blocks until a message arrives (true) or the socket closes (false).
+    virtual bool receive(std::string& message, bool& binary) = 0;
+    virtual void close() = 0;
+};
+
+// Joins the relay for `sessionId` as the host. Null with `error` set on failure,
+// and always null where relaySupported() is false.
+std::unique_ptr<RelaySocket> openRelaySocket(const std::string& baseUrl,
+                                             const std::string& roomId,
+                                             const std::string& sessionId,
+                                             std::string& error);
 
 } // namespace soi

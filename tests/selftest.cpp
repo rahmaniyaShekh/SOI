@@ -16,7 +16,10 @@
 #include "encode/ColorConvert.h"
 #include "encode/H264Encoder.h"
 #include "encode/Quality.h"
+#include "net/RelayFrame.h"
+#include "net/RelayLink.h"
 #include "net/SignalBlob.h"
+#include "util/Crypto.h"
 #include "util/Json.h"
 #include "util/Log.h"
 #include "util/Parallel.h"
@@ -2500,6 +2503,190 @@ void testControlFormat() {
           "a live pid with a different image is not ours (pid reuse)");
 }
 
+// ---------------------------------------------------------------------------
+// Relay: the wire format, and the host's end of the pairing
+// ---------------------------------------------------------------------------
+
+std::vector<uint8_t> fromHex(const std::string& hex) {
+    std::vector<uint8_t> out;
+    for (size_t i = 0; i + 1 < hex.size(); i += 2)
+        out.push_back(static_cast<uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+    return out;
+}
+
+// Stands in for the rendezvous: what the "viewer" sends arrives through
+// push(), and everything the host sends is kept for inspection.
+class FakeRelaySocket final : public RelaySocket {
+public:
+    bool sendBinary(const uint8_t* data, size_t len) override {
+        std::lock_guard lk(mtx_);
+        if (closed_) return false;
+        sent_.emplace_back(data, data + len);
+        cv_.notify_all();
+        return true;
+    }
+    bool sendText(const std::string&) override { return !closed_; }
+    bool receive(std::string& message, bool& binary) override {
+        std::unique_lock lk(mtx_);
+        cv_.wait(lk, [this] { return closed_ || !incoming_.empty(); });
+        if (incoming_.empty()) return false;
+        message = std::move(incoming_.front());
+        incoming_.erase(incoming_.begin());
+        binary = true;
+        return true;
+    }
+    void close() override {
+        std::lock_guard lk(mtx_);
+        closed_ = true;
+        cv_.notify_all();
+    }
+    void push(const std::vector<uint8_t>& msg) {
+        std::lock_guard lk(mtx_);
+        incoming_.emplace_back(msg.begin(), msg.end());
+        cv_.notify_all();
+    }
+    // Waits for at least `n` sent messages; returns a copy of all of them.
+    std::vector<std::vector<uint8_t>> waitSent(size_t n, int ms = 2000) {
+        std::unique_lock lk(mtx_);
+        cv_.wait_for(lk, std::chrono::milliseconds(ms), [&] { return sent_.size() >= n; });
+        return sent_;
+    }
+
+private:
+    std::mutex                        mtx_;
+    std::condition_variable           cv_;
+    std::vector<std::string>          incoming_;
+    std::vector<std::vector<uint8_t>> sent_;
+    bool                              closed_ = false;
+};
+
+template <typename Pred>
+bool waitFor(Pred pred, int ms = 2000) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (!pred()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return true;
+}
+
+void testRelay() {
+    section("relay");
+
+    RelayKey key(32);
+    randomBytes(key.data(), key.size());
+    RelayKey other(32);
+    randomBytes(other.data(), other.size());
+
+    const std::string text = R"({"type":"setQuality","level":"1080p"})";
+    auto sealed = relaySeal(key, kRelayControl, reinterpret_cast<const uint8_t*>(text.data()),
+                            text.size());
+    check(sealed.size() == 12 + 1 + text.size() + 16, "sealed size is iv + type + payload + tag");
+
+    uint8_t type = 0;
+    std::vector<uint8_t> payload;
+    check(relayOpen(key, sealed.data(), sealed.size(), type, payload) && type == kRelayControl &&
+              std::string(payload.begin(), payload.end()) == text,
+          "seal then open round-trips");
+    check(!relayOpen(other, sealed.data(), sealed.size(), type, payload),
+          "another key cannot open it");
+    sealed[20] ^= 1;
+    check(!relayOpen(key, sealed.data(), sealed.size(), type, payload), "a flipped bit is refused");
+    check(!relayOpen(key, sealed.data(), 20, type, payload), "a truncated message is refused");
+
+    std::vector<uint8_t> frame;
+    const uint8_t nal[] = {0, 0, 0, 1, 0x65, 0xAA};
+    relayAppendFrame(frame, true, 0x01020304, nal, sizeof nal);
+    check(frame.size() == 9 + sizeof nal && frame[0] == 1 && frame[1] == 1 && frame[4] == 4 &&
+              frame[8] == sizeof nal && frame[9] == 0,
+          "video frame layout: flags, big-endian ms and length, Annex B");
+
+    RelayKey got;
+    const std::string keyText = base64UrlEncode(key.data(), key.size());
+    check(parseRelayRequest(R"({"relay":1,"key":")" + keyText + "\"}", got) && got == key,
+          "a relay request yields its key");
+    check(!parseRelayRequest("v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\n", got), "an SDP is not a relay request");
+    check(!parseRelayRequest(R"({"relay":2,"key":")" + keyText + "\"}", got),
+          "an unknown relay version is refused");
+    check(!parseRelayRequest(R"({"relay":1,"key":"c2hvcnQ"})", got), "a short key is refused");
+    check(!parseRelayRequest("{\"relay\":1", got), "malformed JSON is refused");
+
+    // --- the host's end, against a stand-in rendezvous ----------------------
+    auto owned = std::make_unique<FakeRelaySocket>();
+    FakeRelaySocket* sock = owned.get();
+    std::atomic<int> lives{0}, keyframes{0}, closes{0}, bitrate{0};
+    std::mutex ctlMtx;
+    std::vector<std::string> controls;
+
+    RelayLink::Callbacks cb;
+    cb.onLive     = [&] { ++lives; };
+    cb.onClosed   = [&] { ++closes; };
+    cb.onKeyframe = [&] { ++keyframes; };
+    cb.onBitrate  = [&](int k) { bitrate = k; };
+    cb.onControl  = [&](const std::string& t) { std::lock_guard lk(ctlMtx); controls.push_back(t); };
+
+    {
+        RelayLink link(std::move(owned), key, cb, 1500, 300, 6000);
+        const uint8_t idr[]   = {0, 0, 0, 1, 0x65, 1, 2, 3};
+        const uint8_t delta[] = {0, 0, 0, 1, 0x41, 4, 5};
+
+        link.sendFrame(idr, sizeof idr, true, 0);
+        check(sock->waitSent(1, 150).empty(), "nothing is sent before the viewer is heard");
+
+        auto viewerSays = [&](const std::string& json, const RelayKey& k) {
+            sock->push(relaySeal(k, kRelayControl, reinterpret_cast<const uint8_t*>(json.data()),
+                                 json.size()));
+        };
+        viewerSays(R"({"type":"hello"})", other);   // not this session's key
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        check(lives == 0 && !link.live(), "a message under the wrong key does not pair");
+
+        viewerSays(R"({"type":"hello"})", key);
+        check(waitFor([&] { return lives == 1; }) && link.live(), "the viewer's hello pairs the relay");
+
+        link.sendFrame(delta, sizeof delta, false, 33'000'000);
+        check(waitFor([&] { return keyframes >= 1; }) && sock->waitSent(1, 150).empty(),
+              "a delta before any keyframe is held back and a keyframe requested");
+
+        link.sendFrame(idr, sizeof idr, true, 66'000'000);
+        link.sendFrame(delta, sizeof delta, false, 99'000'000);
+        const auto sent = sock->waitSent(2);
+        bool ok = sent.size() >= 2;
+        if (ok) {
+            ok = relayOpen(key, sent[0].data(), sent[0].size(), type, payload) &&
+                 type == kRelayVideo && payload[0] == 1 &&
+                 relayOpen(key, sent[1].data(), sent[1].size(), type, payload) &&
+                 type == kRelayVideo && payload[0] == 0 && payload[4] == 33;   // 99 - 66 ms
+        }
+        check(ok, "keyframe then delta go out sealed, in order, with relative timestamps");
+
+        link.sendControl(R"({"type":"quality"})");
+        const auto withCtl = sock->waitSent(3);
+        check(withCtl.size() >= 3 &&
+                  relayOpen(key, withCtl[2].data(), withCtl[2].size(), type, payload) &&
+                  type == kRelayControl,
+              "control goes out as type 2");
+
+        viewerSays(R"({"type":"rx","q":1,"drop":0})", key);
+        viewerSays(R"({"type":"setQuality","level":"480p"})", key);
+        check(waitFor([&] { std::lock_guard lk(ctlMtx); return !controls.empty(); }),
+              "the viewer's control reaches the session");
+        {
+            std::lock_guard lk(ctlMtx);
+            check(controls.size() == 1 && controls[0].find("setQuality") != std::string::npos,
+                  "relay bookkeeping (hello, rx) is not passed on as control");
+        }
+        const int before = keyframes.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));   // past the rate limit
+        viewerSays(R"({"type":"keyframe"})", key);
+        check(waitFor([&] { return keyframes > before; }), "the viewer can ask for a keyframe");
+
+        sock->close();   // the rendezvous closing the socket: the viewer left
+        check(waitFor([&] { return closes == 1; }) && link.closed(), "a closed relay is reported");
+    }
+    check(closes == 1, "closing reports once");
+}
+
 void writeRaw(const std::string& text) {
     std::fflush(stdout);
 #if defined(_WIN32)
@@ -2507,6 +2694,39 @@ void writeRaw(const std::string& text) {
 #endif
     std::fwrite(text.data(), 1, text.size(), stdout);
     std::fflush(stdout);
+}
+
+// relay-seal <key hex> <type> <payload hex>  ->  sealed message, hex
+int runRelaySeal(int argc, char** argv) {
+    if (argc < 5) { std::fprintf(stderr, "usage: relay-seal <keyhex> <type> <payloadhex>\n"); return 2; }
+    const RelayKey key = fromHex(argv[2]);
+    const auto payload = fromHex(argv[4]);
+    const auto sealed = relaySeal(key, static_cast<uint8_t>(std::atoi(argv[3])), payload.data(),
+                                  payload.size());
+    if (sealed.empty()) return 1;
+    writeRaw(toHex(sealed.data(), sealed.size()));
+    return 0;
+}
+
+// relay-open <key hex> <message hex>  ->  "<type> <payload hex>"
+int runRelayOpen(int argc, char** argv) {
+    if (argc < 4) { std::fprintf(stderr, "usage: relay-open <keyhex> <msghex>\n"); return 2; }
+    const RelayKey key = fromHex(argv[2]);
+    const auto msg = fromHex(argv[3]);
+    uint8_t type = 0;
+    std::vector<uint8_t> payload;
+    if (!relayOpen(key, msg.data(), msg.size(), type, payload)) return 1;
+    writeRaw(std::to_string(type) + " " + toHex(payload.data(), payload.size()));
+    return 0;
+}
+
+// relay-request <plaintext>  ->  key hex, or exit 1 if it is not a relay request
+int runRelayRequest(int argc, char** argv) {
+    if (argc < 3) return 2;
+    RelayKey key;
+    if (!parseRelayRequest(argv[2], key)) return 1;
+    writeRaw(toHex(key.data(), key.size()));
+    return 0;
 }
 
 int runBlobEncode(int argc, char** argv) {
@@ -2745,6 +2965,12 @@ int main(int argc, char** argv) {
         rc = runBlobEncode(argc, argv);
     } else if (argc > 1 && std::strcmp(argv[1], "blob-decode") == 0) {
         rc = runBlobDecode(argc, argv);
+    } else if (argc > 1 && std::strcmp(argv[1], "relay-seal") == 0) {
+        rc = runRelaySeal(argc, argv);
+    } else if (argc > 1 && std::strcmp(argv[1], "relay-open") == 0) {
+        rc = runRelayOpen(argc, argv);
+    } else if (argc > 1 && std::strcmp(argv[1], "relay-request") == 0) {
+        rc = runRelayRequest(argc, argv);
 #if defined(_WIN32)
     } else if (argc > 1 && std::strcmp(argv[1], "capture-bench") == 0) {
         rc = runCaptureBench();
@@ -2771,6 +2997,7 @@ int main(int argc, char** argv) {
         testTokens();
         testJson();
         testControlFormat();
+        testRelay();
 #if !defined(_WIN32)
         testEncoder();
         testMacGpuEncode();

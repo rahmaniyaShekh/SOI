@@ -21,6 +21,8 @@
 
 #include <rtc/rtc.hpp>
 
+#include "net/RelayLink.h"
+
 namespace soi {
 
 struct StreamerConfig {
@@ -53,6 +55,11 @@ struct StreamStats {
     double   rttMs         = 0.0;
     int      targetBitrateKbps = 0;
     bool     rembSeen      = false;
+    // Relay only.
+    bool     relayed       = false;
+    uint64_t framesDropped = 0;
+    double   relaySendMs   = 0.0;
+    int      viewerBacklog = 0;
 };
 
 class Streamer {
@@ -83,13 +90,31 @@ public:
     bool start(const StreamerConfig& cfg);
     void stop();
 
-    // Blocks until ICE gathering completes. There is no signalling channel to
-    // trickle candidates over, so the offer is only useful once it is complete.
-    bool waitForGathering(std::chrono::milliseconds timeout);
+    // Waits for ICE gathering. There is no signalling channel to trickle
+    // candidates over, so the offer has to carry them -- but a slow or filtered
+    // STUN server must not hold it hostage: once the first public candidate is
+    // in, the rest get one more second. Returns true if gathering completed.
+    // `cancel` is checked every 100 ms so a stop is never kept waiting.
+    bool waitForGathering(std::chrono::milliseconds timeout,
+                          const std::function<bool()>& cancel = {});
 
     std::string localDescriptionSdp() const;
     bool        acceptAnswer(const std::string& sdp, std::string& error);
-    bool        waitForConnected(std::chrono::milliseconds timeout);
+    // `cancel` is checked every 100 ms; returns false if it fired.
+    bool        waitForConnected(std::chrono::milliseconds timeout,
+                                 const std::function<bool()>& cancel = {});
+
+    // Gives up on the peer connection -- the two networks cannot reach each
+    // other -- and carries the session over the rendezvous relay instead.
+    // Video, control and keyframe requests then go through `socket`, sealed
+    // with `key`; everything above this class carries on unchanged.
+    // isConnected() turns true once the viewer is heard on the relay.
+    void startRelay(std::unique_ptr<RelaySocket> socket, RelayKey key);
+    bool relayed() const { return relayed_.load(); }
+
+    // The most frames a second this transport should carry, or 0 for no
+    // limit beyond the encoder's own.
+    int frameRateCap() const { return relayed_.load() ? kRelayMaxFps : 0; }
 
     bool isConnected() const { return connected_.load(); }
     bool hasFailed()   const { return failed_.load(); }
@@ -122,12 +147,15 @@ private:
     std::shared_ptr<rtc::DataChannel>              control_;
     std::shared_ptr<rtc::RtpPacketizationConfig>   rtpConfig_;
     std::shared_ptr<rtc::RtcpSrReporter>           srReporter_;
+    std::unique_ptr<RelayLink>                     relay_;
+    std::atomic<bool>                              relayed_{false};
 
     StreamerConfig cfg_{};
 
     mutable std::mutex      mtx_;
     std::condition_variable cv_;
     bool                    gatheringComplete_ = false;
+    std::chrono::steady_clock::time_point firstPublicCandidate_{};
 
     std::atomic<bool> connected_{false};
     std::atomic<bool> failed_{false};
