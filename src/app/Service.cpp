@@ -273,7 +273,12 @@ std::string stateDirectory() {
 #if defined(__APPLE__)
     // Where per-user application data lives on a Mac. The folder is created
     // 0700 so another account on the same machine cannot read the share code.
-    const std::string support = homeDirectory() + "/Library/Application Support";
+    // Each level is created if missing: a normal account always has
+    // ~/Library, but a fresh or scrubbed HOME may not, and without the folder
+    // nothing else here -- not even the instance lock -- can work.
+    const std::string library = homeDirectory() + "/Library";
+    const std::string support = library + "/Application Support";
+    mkdir(library.c_str(), 0700);
     mkdir(support.c_str(), 0700);
     const std::string dir = support + "/soi-share";
 #else
@@ -534,7 +539,11 @@ unsigned long spawnDetached(const std::vector<std::string>& args) {
 bool acquireInstanceLock() {
     const std::string path = stateFilePath("instance.lock");
     const int fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-    if (fd < 0) return false;
+    if (fd < 0) {
+        // Not "another instance is running": say what actually went wrong.
+        std::fprintf(stderr, "cannot create %s: %s\n", path.c_str(), std::strerror(errno));
+        return false;
+    }
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         close(fd);
         return false;
