@@ -54,6 +54,16 @@ echo "== detached start / status / stop =="
 sh -c "\"$bin\" start --no-code --no-stun --port 0 > \"$home/start.log\" 2>&1; echo \$? > \"$home/start.rc\""
 cat "$home/start.log"
 check "start returns success" [ "$(cat "$home/start.rc")" = 0 ]
+if [ "$(cat "$home/start.rc")" != 0 ]; then
+    # Diagnose: the same instance, attached, so its own output is visible.
+    echo "  -- the background copy failed; running it in the foreground for 8 s:"
+    "$bin" start --foreground --no-code --no-stun --port 0 > "$home/fg.log" 2>&1 &
+    fg=$!
+    sleep 8
+    kill "$fg" 2>/dev/null || true
+    wait "$fg" 2>/dev/null; echo "  -- exit status $?"
+    sed 's/^/     | /' "$home/fg.log"
+fi
 sleep 2
 status=$("$bin" status || true)
 echo "$status"
@@ -87,6 +97,7 @@ check "installing twice leaves one PATH block" [ "$(grep -c '>>> soi-share >>>' 
 check "the installed copy says it is installed" \
     sh -c "\"$home/.soi-share/bin/soi-share\" version | grep -q 'the installed copy'"
 
+mkdir -p "$state"
 echo "machine.code-test" > "$state/machine.code"
 "$home/.soi-share/bin/soi-share" uninstall
 check "uninstall removes the program" [ ! -e "$home/.soi-share" ]
