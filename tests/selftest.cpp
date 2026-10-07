@@ -2084,8 +2084,9 @@ void testEncoder() {
     }
 
     check(encoded > 0, "produces encoded output", soi::format("{} frames", encoded));
-    check(encoded >= kFrames * 9 / 10, "encodes at least 90% of a paced 30fps feed",
-          soi::format("{} of {}", encoded, kFrames));
+    // A throughput budget, so advisory on shared CI machines like the others.
+    checkTiming(encoded >= kFrames * 9 / 10, "encodes at least 90% of a paced 30fps feed",
+                soi::format("{} of {}", encoded, kFrames));
     check(keys > 0, "emits at least one keyframe");
     check(annexB, "every access unit starts with an Annex-B start code");
     check(sps, "keyframes carry SPS so a late-joining viewer can decode");
