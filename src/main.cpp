@@ -1041,8 +1041,8 @@ public:
         const auto now = std::chrono::steady_clock::now();
         if (next_ < now) { next_ = now; return; }   // fell behind: do not spiral
 
-        const auto delay = next_ - now;
 #if defined(_WIN32)
+        const auto delay = next_ - now;
         if (!timer_) { std::this_thread::sleep_for(delay); return; }
 
         LARGE_INTEGER due;

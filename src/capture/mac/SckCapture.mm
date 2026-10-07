@@ -51,8 +51,8 @@ API_AVAILABLE(macos(12.3))
     didOutputSampleBuffer:(CMSampleBufferRef)sample
                    ofType:(SCStreamOutputType)type {
     if (type != SCStreamOutputTypeScreen) return;
-    auto shared = self->shared;
-    if (!shared) return;
+    auto state = self->shared;
+    if (!state) return;
 
     SCFrameStatus status = SCFrameStatusComplete;
     CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample, false);
@@ -66,23 +66,23 @@ API_AVAILABLE(macos(12.3))
     if (!buffer) return;
     CVPixelBufferRetain(buffer);
     {
-        std::lock_guard lk(shared->mtx);
-        if (shared->latest) CVPixelBufferRelease(shared->latest);
-        shared->latest = buffer;
-        shared->fresh  = true;
+        std::lock_guard lk(state->mtx);
+        if (state->latest) CVPixelBufferRelease(state->latest);
+        state->latest = buffer;
+        state->fresh  = true;
     }
-    shared->cv.notify_all();
+    state->cv.notify_all();
 }
 
 - (void)stream:(SCStream*)stream didStopWithError:(NSError*)error {
-    auto shared = self->shared;
-    if (!shared) return;
+    auto state = self->shared;
+    if (!state) return;
     {
-        std::lock_guard lk(shared->mtx);
-        shared->error = error ? [[error localizedDescription] UTF8String] : "stopped";
+        std::lock_guard lk(state->mtx);
+        state->error = error ? [[error localizedDescription] UTF8String] : "stopped";
     }
-    shared->failed.store(true);
-    shared->cv.notify_all();
+    state->failed.store(true);
+    state->cv.notify_all();
 }
 @end
 

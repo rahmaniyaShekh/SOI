@@ -47,7 +47,8 @@ struct CgImageCapture::Impl {
             context = CGBitmapContextCreate(pixels.data(), static_cast<size_t>(w),
                                             static_cast<size_t>(h), 8, static_cast<size_t>(w) * 4,
                                             space,
-                                            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+                                            static_cast<uint32_t>(kCGImageAlphaPremultipliedFirst) |
+                                                static_cast<uint32_t>(kCGBitmapByteOrder32Little));
             if (!context) return false;
             CGContextSetInterpolationQuality(context, kCGInterpolationMedium);
         }

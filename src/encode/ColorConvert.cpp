@@ -68,11 +68,10 @@ bool detectSsse3() {
 }
 
 const bool g_ssse3 = detectSsse3();
-#elif defined(SOI_NEON)
-const bool g_ssse3 = false;   // NEON is part of every ARMv8 CPU; see yRowNeon
-#else
+#elif !defined(SOI_NEON)
 const bool g_ssse3 = false;
 #endif
+// (NEON is part of every ARMv8 CPU, so there is nothing to detect; see yRowNeon.)
 
 // ---------------------------------------------------------------------------
 // Y plane, 4 pixels per iteration.
@@ -154,7 +153,7 @@ void yRowNeon(const uint8_t* src, uint8_t* dstY, int width) {
 }
 #endif
 
-void yRowScalar(const uint8_t* src, uint8_t* dstY, int width) {
+[[maybe_unused]] void yRowScalar(const uint8_t* src, uint8_t* dstY, int width) {
     for (int x = 0; x < width; ++x) {
         const uint8_t b = src[x * 4 + 0], g = src[x * 4 + 1], r = src[x * 4 + 2];
         dstY[x] = clampByte((kYR * r + kYG * g + kYB * b + kYOffset) >> kShift);

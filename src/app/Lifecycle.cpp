@@ -526,7 +526,13 @@ int cmdUninstall(bool purge) {
             std::printf("  program   could not schedule removal of %s: %s\n", dir.c_str(), error.c_str());
             return 1;
         }
+#if defined(_WIN32)
         std::printf("  program   %s is removed a few seconds after this exits\n", dir.c_str());
+#else
+        // A running binary can be unlinked here, so it is already gone.
+        rmdir(directoryOf(dir).c_str());   // ~/.soi-share, if nothing else is in it
+        std::printf("  program   removed %s\n", dir.c_str());
+#endif
     } else if (removeDirectoryTree(dir)) {
 #if !defined(_WIN32)
         rmdir(directoryOf(dir).c_str());   // ~/.soi-share, if nothing else is in it
