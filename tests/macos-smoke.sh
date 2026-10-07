@@ -61,7 +61,8 @@ if [ "$(cat "$home/start.rc")" != 0 ]; then
     fg=$!
     sleep 8
     kill "$fg" 2>/dev/null || true
-    wait "$fg" 2>/dev/null; echo "  -- exit status $?"
+    rc=0; wait "$fg" 2>/dev/null || rc=$?
+    echo "  -- exit status $rc"
     sed 's/^/     | /' "$home/fg.log"
 fi
 sleep 2

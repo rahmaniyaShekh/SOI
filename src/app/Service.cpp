@@ -578,7 +578,10 @@ unsigned long spawnDetached(const std::vector<std::string>& args) {
 
     // A new session (setsid) means no controlling terminal: closing the window
     // that ran `start` sends SIGHUP to that terminal's session, and this child
-    // is not in it. stdio goes to /dev/null -- the child logs to its file.
+    // is not in it. stdin is /dev/null; stdout/stderr go to soi-share.stderr
+    // until the child has its own log open (main.cpp then points them at
+    // /dev/null), so anything that kills it before that point -- a loader
+    // error, an abort -- is on disk for `start` to show.
     //
     // The working directory is the state folder, not the caller's, so a
     // long-lived share never pins whatever folder `start` was typed in.
@@ -587,8 +590,10 @@ unsigned long spawnDetached(const std::vector<std::string>& args) {
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    const std::string early = stateFilePath("soi-share.stderr");
+    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, early.c_str(),
+                                     O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
 
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);

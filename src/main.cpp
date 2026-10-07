@@ -43,6 +43,7 @@
   #include <d3d11.h>
 #else
   #include <csignal>
+  #include <fcntl.h>
   #include <unistd.h>
 #endif
 
@@ -2252,6 +2253,13 @@ int runInstance(const Options& opt, const std::vector<std::string>& args) {
         // not, so the launching terminal closing can never reach it.
         setsid();
         std::signal(SIGHUP, SIG_IGN);
+        // Its log is open now, so the early-failure file has done its job.
+        if (const int null = open("/dev/null", O_WRONLY); null >= 0) {
+            dup2(null, STDOUT_FILENO);
+            dup2(null, STDERR_FILENO);
+            close(null);
+        }
+        removeStateFile("soi-share.stderr");
     }
 #endif
 
@@ -2347,6 +2355,13 @@ int cmdStart(int argc, char** argv) {
                          : "\nsoi-share has not produced a share code after 60 s "
                            "(it is still trying; `soi-share status` shows how far it got).\n");
         printLogTail(logPath, 12);
+#if !defined(_WIN32)
+        // What it said before its log existed, if it got no further.
+        if (std::string early; readStateFile("soi-share.stderr", early) && !early.empty())
+            std::printf("  it reported:
+%s
+", early.c_str());
+#endif
         return 1;
     }
 
