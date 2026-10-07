@@ -2358,9 +2358,7 @@ int cmdStart(int argc, char** argv) {
 #if !defined(_WIN32)
         // What it said before its log existed, if it got no further.
         if (std::string early; readStateFile("soi-share.stderr", early) && !early.empty())
-            std::printf("  it reported:
-%s
-", early.c_str());
+            std::printf("  it reported:\n%s\n", early.c_str());
 #endif
         return 1;
     }
