@@ -17,6 +17,7 @@
   #include <iostream>
 #endif
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 

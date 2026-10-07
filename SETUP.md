@@ -3,7 +3,8 @@
 **Using soi-share needs nothing installed first.** You don't need a runtime, compiler,
 package manager, admin rights, Visual C++ redistributable or DLLs. The release is one
 self-contained `soi-share.exe` that installs, updates and uninstalls itself. Part 1 is all
-most people need.
+most people need. **On a Mac, see [Part 1 on macOS](#part-1-on-macos)**: one universal
+binary that runs from the folder you unzip it into.
 
 [Part 2](#maintainers-only) is only for whoever builds the exe, publishes releases, or
 hosts their own rendezvous.
@@ -325,6 +326,106 @@ soi-share installs no service, and the only registry value it touches is your us
 
 ---
 
+# Part 1 on macOS
+
+## Requirements
+
+| What | Notes |
+|---|---|
+| macOS 10.15 Catalina or newer | One universal binary for Apple silicon and Intel Macs. macOS 12.3+ captures through ScreenCaptureKit (GPU-resident frames, single windows, the system-drawn cursor); 10.15 to 12.2 use CGDisplayStream. |
+| Screen Recording permission | Granted to your **terminal app** (Terminal, iTerm2, VS Code...), once. `soi-share start` asks for it and says exactly what to click. |
+| Internet access | For the share code. On the same Wi-Fi, `--no-code` works without it. |
+
+Nothing else: no Homebrew, no Xcode, no admin rights. Everything the binary uses
+(VideoToolbox, ScreenCaptureKit, libcurl, the Keychain) is part of macOS, and the rest is
+compiled in.
+
+## Run it from its folder (no install)
+
+1. Download `soi-share-macos.zip` from the
+   [latest release](https://github.com/rahmaniyaShekh/SOI/releases/latest). Safari unzips
+   it by itself; otherwise double-click it. You get a `soi-share` folder.
+2. Open Terminal **in that folder**. In Finder, right-click the folder and choose
+   *New Terminal at Folder*, or type `cd ~/Downloads/soi-share`.
+3. The binary isn't notarized by Apple, so macOS blocks it as "downloaded from the
+   internet" until you clear that mark, once:
+
+   ```bash
+   xattr -d com.apple.quarantine soi-share
+   ```
+
+   Skipping this gets you *"soi-share" cannot be opened* or *Apple could not verify...*.
+   The other way out is System Settings → Privacy & Security → **Allow Anyway**, which
+   appears after the first blocked attempt.
+4. Start sharing:
+
+   ```bash
+   ./soi-share start
+   ```
+
+   **The first time**, macOS asks for Screen Recording permission for your terminal app.
+   Turn it on in System Settings → Privacy & Security → **Screen Recording** (macOS 15:
+   *Screen & System Audio Recording*), then **quit the terminal app completely (Cmd+Q)**
+   and open it again: macOS only applies the permission to a freshly started app. Run
+   `./soi-share start` again.
+
+From then on it's the same as on Windows, with `./` in front because the folder isn't on
+your PATH:
+
+```bash
+./soi-share start          # share in the background; prints a 6-character code
+./soi-share status         # pid, uptime, the code, live stats
+./soi-share stop           # stop sharing
+./soi-share help           # everything else
+```
+
+`start` runs the share **detached**, in the background with no terminal attached, so
+closing the Terminal window does not stop it. `status` and `stop` reach it from any
+terminal.
+
+## Optional: install, update, uninstall
+
+```bash
+./soi-share install        # copy to ~/.soi-share/bin and add it to PATH (~/.zshrc,
+                           # ~/.bash_profile for bash); then plain `soi-share` works
+soi-share update           # newest release: checksum-verified, replaced in place
+soi-share uninstall        # undo install; your share code is kept unless --purge
+```
+
+`install` changes only your own files: the PATH line is a marked block that `uninstall`
+removes again. `update` works on an uninstalled copy too: it replaces the binary in the
+folder you run it from. The private repository needs the same read-only token as on
+Windows ([the access token](#private-repository-the-access-token)); `update` asks for it
+once and saves it in your **login Keychain**.
+
+## What lives where (macOS)
+
+| Thing | Location | Removed by |
+|---|---|---|
+| The program | wherever you unzipped it; after `install`, `~/.soi-share/bin/` (+ a block in `~/.zshrc`) | delete the folder / `soi-share uninstall` |
+| Share code, log | `~/Library/Application Support/soi-share/` | `soi-share uninstall --purge` or `soi-share purge` |
+| Saved GitHub token | login Keychain, item "soi-share" | `soi-share update --forget-token` |
+| Screen Recording permission | System Settings → Privacy & Security | you, in System Settings |
+
+## Troubleshooting (macOS)
+
+**The viewer sees only the wallpaper, or `start` keeps asking for permission.** The
+permission was granted to a different terminal app, or the terminal wasn't restarted
+afterwards. `soi-share capture-check` shows which capture backends can read the screen.
+
+**`zsh: permission denied: ./soi-share`.** The executable bit was lost, which happens
+when the binary is copied out of the zip by something other than Finder or `ditto`. Fix
+it with `chmod +x soi-share`.
+
+**`zsh: command not found: soi-share`.** It isn't installed. Type `./soi-share` in its
+folder, or run `./soi-share install` and open a new terminal.
+
+**A window share or `--desktop` is slow.** `--desktop` (every display at once) goes
+through the slowest capture backend. Sharing one display is compositor-driven and much
+cheaper.
+
+---
+
 # Maintainers only
 
 **Nothing below is needed to use soi-share.** This part covers building `soi-share.exe`,
@@ -396,10 +497,34 @@ it's the negative test for a wrong passphrase.
 **`LNK1104: cannot open file 'soi-share.exe'`** means a share is running from the build
 folder. Run `.\build\Release\soi-share.exe stop` first.
 
+### Building on a Mac
+
+Xcode or its Command Line Tools (`xcode-select --install`), CMake (`brew install cmake`
+or the cmake.org app) and vcpkg for a static OpenSSL. The overlay triplets in
+`tools/vcpkg-triplets` keep OpenSSL at the binary's minimum macOS:
+
+```bash
+git clone https://github.com/microsoft/vcpkg.git ~/vcpkg && ~/vcpkg/bootstrap-vcpkg.sh
+~/vcpkg/vcpkg install openssl:arm64-osx-soi --overlay-triplets=tools/vcpkg-triplets
+cmake -S . -B build-arm64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DCMAKE_TOOLCHAIN_FILE=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake \
+  -DVCPKG_TARGET_TRIPLET=arm64-osx-soi -DVCPKG_OVERLAY_TRIPLETS=$PWD/tools/vcpkg-triplets
+cmake --build build-arm64 --parallel
+build-arm64/soi-selftest unit                       # incl. a VideoToolbox encode + decode
+build-arm64/soi-selftest                            # + capture (needs Screen Recording)
+tests/macos-smoke.sh build-arm64/soi-share 0.0.0    # detached lifecycle, install/uninstall
+```
+
+For the Intel slice use `x86_64` / `x64-osx-soi`; the release job builds both and joins
+them with `lipo`. `tools/check-macos-binary.sh` is the counterpart of `check-dlls.ps1`:
+both slices present, only `/usr/lib` and `/System` libraries, ScreenCaptureKit
+weak-linked, and the minimum macOS still 10.15 / 11.0. Any call to an API newer than
+that which isn't behind `@available` is a compile error (`-Werror=unguarded-availability`).
+
 ## M2. Publish a release
 
-Users never build anything. They get the exe that GitHub Actions builds
-(`.github/workflows/release.yml`) on a `windows-latest` runner.
+Users never build anything. They get the exe and the macOS zip that GitHub Actions
+builds (`.github/workflows/release.yml`) on `windows-latest` and `macos-15` runners.
 
 ```powershell
 git tag v1.2.0
@@ -410,13 +535,22 @@ gh run watch        # or the Actions tab
 The workflow:
 
 1. Builds with `-DSOI_VERSION` taken from the tag, so `v1.2.0` becomes `1.2.0`.
-2. Runs the unit tests, the DLL allow-list check, the version-stamp check and the
-   install/uninstall smoke test. Any failure stops the release.
-3. Stages `soi-share.exe`, `install.ps1`, `viewer.html` and `THIRD_PARTY_NOTICES.md`, and
-   writes `SHA256SUMS.txt` in `sha256sum` format.
-4. Creates the release, or updates it with `--clobber` if the tag was published before.
-5. Runs the documented one-liner in Windows PowerShell 5.1 against what it just published,
-   and checks that the installed `soi-share version` matches.
+2. **Windows:** runs the unit tests, the signalling interop test, the DLL allow-list
+   check, the version-stamp check and the install/uninstall smoke test.
+3. **macOS:** builds arm64 and x86_64, joins them into one ad-hoc-signed universal binary
+   and checks it with `check-macos-binary.sh`; runs the unit tests on Apple silicon and
+   (under Rosetta) Intel, the interop test, `macos-smoke.sh` (detached start, status and
+   stop from a shell that has exited, then install/uninstall in a throwaway HOME), and an
+   end-to-end session watched in Google Chrome through the real viewer, including a
+   quality change sent back over the data channel. Then it zips the binary with
+   `viewer.html`, the notices and `tools/macos-README.txt` as `soi-share-macos.zip`, and
+   runs that zip the way a user would. Any failure on either platform stops the release.
+4. Stages `soi-share.exe`, `soi-share-macos.zip`, `install.ps1`, `viewer.html` and
+   `THIRD_PARTY_NOTICES.md`, and writes `SHA256SUMS.txt` in `sha256sum` format.
+5. Creates the release, or updates it with `--clobber` if the tag was published before.
+6. Runs the documented one-liner in Windows PowerShell 5.1 against what it just published,
+   and on macOS downloads the zip and runs `soi-share update --force` on it, checking that
+   both report the new version.
 
 Running the workflow by hand (*Actions → Build and Release → Run workflow*) builds and
 tests the current commit without publishing. Give it a tag to publish or re-publish that

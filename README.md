@@ -1,13 +1,15 @@
-# SOI — Serverless P2P Screen Share (Windows, WebRTC)
+# SOI — Serverless P2P Screen Share (Windows and macOS, WebRTC)
 
-A terminal-only Windows screen-sharing sender in C++20. Streams hardware-encoded H.264
-over WebRTC **directly to a peer, with no signalling server of your own**, to a
-single-file browser viewer that needs no install.
+A terminal-only screen-sharing sender for Windows and macOS in C++20. Streams
+hardware-encoded H.264 over WebRTC **directly to a peer, with no signalling server of your
+own**, to a single-file browser viewer that needs no install.
 
 It captures **everything on the screen** — ordinary windows, GPU-composited apps like
 Chrome and Electron, exclusive-fullscreen games, and hardware-overlay video — by choosing
 automatically between DXGI Desktop Duplication, Windows.Graphics.Capture and GDI, and
-switching between them live if one stops delivering. See §1.2a.
+switching between them live if one stops delivering. See §1.2a. On macOS the same design
+picks between ScreenCaptureKit, CGDisplayStream and CGImage capture and encodes with
+VideoToolbox; most of what follows describes the Windows implementation, which came first.
 
 No GUI. No service to install. No configuration. Runs detached, controlled from any
 terminal.
@@ -33,6 +35,24 @@ works in the same window and in every new one.
 [latest release](https://github.com/rahmaniyaShekh/SOI/releases/latest) and double-click it.
 It installs itself the same way and explains what to type next. The exe is unsigned, so if
 SmartScreen appears, click **More info → Run anyway**.
+
+### macOS
+
+On macOS 10.15 or newer, Apple silicon or Intel, download `soi-share-macos.zip` from the
+[latest release](https://github.com/rahmaniyaShekh/SOI/releases/latest) and run it from the
+folder it unzips to. There's nothing to install:
+
+```bash
+cd ~/Downloads/soi-share
+xattr -d com.apple.quarantine soi-share    # once: the binary is not notarized
+./soi-share start
+```
+
+The first `start` asks for **Screen Recording** permission for your terminal app. Allow it
+in System Settings → Privacy & Security, quit and reopen the terminal, and run
+`./soi-share start` again. Everything below works the same, with `./soi-share` in place of
+`soi-share` (or run `./soi-share install` once to put it on your PATH).
+[SETUP.md, Part 1 on macOS](SETUP.md#part-1-on-macos) has the details.
 
 ## Use
 

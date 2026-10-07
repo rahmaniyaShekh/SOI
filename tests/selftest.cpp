@@ -39,6 +39,7 @@
 #include "capture/mac/MacCapture.h"
 #include "gpu/GpuPipeline.h"
 #include "selftest_mac.h"
+#include <cstdlib>
 #include <unistd.h>
 #endif
 

@@ -19,6 +19,7 @@
   #include <atomic>
   #include <cerrno>
   #include <climits>
+  #include <cstdio>
   #include <cstdlib>
   #include <cstring>
 extern char** environ;

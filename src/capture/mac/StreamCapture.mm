@@ -7,6 +7,7 @@
 #include "util/Log.h"
 
 #import <CoreGraphics/CoreGraphics.h>
+#import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
 
@@ -81,7 +82,7 @@ bool StreamCapture::start() {
                 (__bridge_transfer id)CGColorSpaceCreateWithName(kCGColorSpaceSRGB),
         };
         im.stream = CGDisplayStreamCreateWithDispatchQueue(
-            g.id, static_cast<size_t>(im.w), static_cast<size_t>(im.h), 'BGRA',
+            g.id, static_cast<size_t>(im.w), static_cast<size_t>(im.h), kCVPixelFormatType_32BGRA,
             (__bridge CFDictionaryRef)props, im.queue,
             ^(CGDisplayStreamFrameStatus status, uint64_t, IOSurfaceRef surface,
               CGDisplayStreamUpdateRef) {
