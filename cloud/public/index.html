@@ -459,8 +459,11 @@ async function driver(code,pendingName,known,gen){
     // listening on this very session, so ask it for the relay right away
     // rather than waiting for a fresh offer.
     if(outcome==='nopath'){ useRelay=true; continue; }
+    // The direct attempt failed after the sender had our answer: next time,
+    // the relay.
+    if(outcome==='nodirect') useRelay=true;
 
-    const failed=outcome==='failed'||outcome==='timeout';
+    const failed=outcome==='failed'||outcome==='timeout'||outcome==='nodirect';
     failedInARow=failed?failedInARow+1:0;
     if(viaRelay&&failed&&++relayFails>=2){
       useRelay=false; relayFails=0;
@@ -579,7 +582,7 @@ async function attempt(id,code,room,gen,onLive,canRelay){
       if(streaming&&el.video.videoWidth>0) done.resolve('connected');
       if(canRelay&&!probing&&Date.now()-posted>NOPATH_AFTER){
         probing=true;
-        noPath(pc).then(stuck=>{ probing=false; if(stuck) done.resolve('nopath'); });
+        noPath(pc,posted).then(stuck=>{ probing=false; if(stuck) done.resolve('nopath'); });
       }
     },250);
 
@@ -617,7 +620,14 @@ async function attempt(id,code,room,gen,onLive,canRelay){
     }
 
     pc.close();
-    return why==='nopath'?'nopath':'failed';
+    if(why==='nopath') return 'nopath';
+    // The sender gave up on an answer it had applied (it republishes 15 s
+    // after reading one), or the attempt timed out: no direct path formed.
+    // With a relay on offer that is the cue to use it, whatever this browser's
+    // ICE statistics did or did not show. A quick 'stale' is different -- the
+    // sender replacing its offer to let us back in -- and is not a failure.
+    if(canRelay&&Date.now()-posted>=NOPATH_AFTER) return 'nodirect';
+    return 'failed';
   }catch(err){
     try{ pc.close() }catch{}
     return 'failed';
@@ -626,15 +636,21 @@ async function attempt(id,code,room,gen,onLive,canRelay){
 
 // True when ICE has been sending connectivity checks and not one has been
 // answered: no direct path exists between these two networks.
-const NOPATH_AFTER=7000;
-async function noPath(pc){
+// Browsers that do not report the check counters (Firefox, Safari) fall back to
+// time: ICE that has found no path within 10 s of the answer is not going to.
+const NOPATH_AFTER=7000, NOPATH_BY_TIME=10000;
+async function noPath(pc,posted){
   try{
     if(pc.iceConnectionState==='connected'||pc.iceConnectionState==='completed') return false;
-    let sent=0,answered=0;
+    let sent=0,answered=0,counted=false;
     (await pc.getStats()).forEach(r=>{
-      if(r.type==='candidate-pair'){ sent+=r.requestsSent||0; answered+=r.responsesReceived||0; }
+      if(r.type!=='candidate-pair') return;
+      if(r.requestsSent!==undefined) counted=true;
+      sent+=r.requestsSent||0; answered+=r.responsesReceived||0;
     });
-    return sent>10&&answered===0&&pc.iceConnectionState!=='connected';
+    if(pc.iceConnectionState==='connected'||pc.iceConnectionState==='completed') return false;
+    if(counted&&sent>10&&answered===0) return true;
+    return Date.now()-posted>NOPATH_BY_TIME;
   }catch{ return false }
 }
 
