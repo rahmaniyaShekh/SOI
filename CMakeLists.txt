@@ -343,8 +343,10 @@ if(SOI_BUILD_APP)
     target_link_libraries(soi-share PRIVATE
         soi-core
         LibDataChannel::LibDataChannel
-        $<$<PLATFORM_ID:Windows>:ws2_32 iphlpapi>
     )
+    if(WIN32)
+        target_link_libraries(soi-share PRIVATE ws2_32 iphlpapi)
+    endif()
     if(MSVC)
         # No debug information in the shipped exe (Release links without
         # /DEBUG, so there is no PDB path either); drop unreferenced code and
