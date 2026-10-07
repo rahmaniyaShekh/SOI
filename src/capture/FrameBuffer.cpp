@@ -143,6 +143,8 @@ bool parseBackendName(std::string_view name, CaptureBackend& out) {
     return false;
 }
 
+const char* backendChoices() { return "auto, dxgi, wgc, bitblt"; }
+
 void computeEncodeSize(int srcW, int srcH, int maxWidth, int& outW, int& outH) {
     auto evenDown = [](int v) { return v & ~1; };
     if (maxWidth > 0 && srcW > maxWidth) {

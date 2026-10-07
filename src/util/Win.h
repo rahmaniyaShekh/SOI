@@ -4,6 +4,8 @@
 // Deliberately small: only the operations actually used are exposed, so there is
 // no ambiguity about ownership at call sites.
 //
+#include "util/Platform.h"
+
 #include <windows.h>
 #include <string>
 #include <utility>
@@ -153,21 +155,6 @@ inline std::wstring toUtf16(std::string_view s) {
     std::wstring out(static_cast<size_t>(n), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), n);
     return out;
-}
-
-// Case-insensitive substring test, used for --window title matching.
-inline bool containsNoCase(std::string_view hay, std::string_view needle) {
-    if (needle.empty()) return true;
-    if (needle.size() > hay.size()) return false;
-    auto lower = [](char c) {
-        return static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c);
-    };
-    for (size_t i = 0; i + needle.size() <= hay.size(); ++i) {
-        size_t j = 0;
-        while (j < needle.size() && lower(hay[i + j]) == lower(needle[j])) ++j;
-        if (j == needle.size()) return true;
-    }
-    return false;
 }
 
 } // namespace soi

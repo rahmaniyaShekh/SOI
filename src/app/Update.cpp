@@ -1,13 +1,21 @@
 #include "app/Update.h"
 #include "app/Service.h"
+#include "util/Crypto.h"
 #include "util/Json.h"
 #include "util/Log.h"
-#include "util/Win.h"
+#include "util/Platform.h"
 
-#include <windows.h>
-#include <bcrypt.h>
-#include <dpapi.h>
-#include <winhttp.h>
+#if defined(_WIN32)
+  #include "util/Win.h"
+  #include <windows.h>
+  #include <dpapi.h>
+  #include <winhttp.h>
+#else
+  #include "util/HttpCurl.h"
+  #include <termios.h>
+  #include <unistd.h>
+  #include <iostream>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -20,10 +28,15 @@ namespace soi {
 namespace {
 
 constexpr size_t kMaxDownloadBytes = 128u * 1024 * 1024;
+#if defined(_WIN32)
 constexpr char   kTokenFile[]      = "github-token.dpapi";
 // Binds the DPAPI blob to this purpose: a blob some other program protected
 // for the same user will not decrypt as our token.
 constexpr char   kTokenEntropy[]   = "soi-share/github-token/v1";
+#else
+// The Keychain account the token is stored under (service "soi-share").
+constexpr char   kTokenAccount[]   = "github-token";
+#endif
 
 bool isHex(char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
@@ -35,6 +48,7 @@ std::string lower(std::string s) {
     return s;
 }
 
+#if defined(_WIN32)
 struct HInternet {
     HINTERNET h = nullptr;
     explicit HInternet(HINTERNET v) : h(v) {}
@@ -42,6 +56,7 @@ struct HInternet {
     HInternet(const HInternet&) = delete;
     HInternet& operator=(const HInternet&) = delete;
 };
+#endif
 
 std::string hostOf(const std::string& url) {
     const size_t scheme = url.find("://");
@@ -49,16 +64,6 @@ std::string hostOf(const std::string& url) {
     const size_t start = scheme + 3;
     const size_t end = url.find_first_of("/:?#", start);
     return lower(url.substr(start, end == std::string::npos ? std::string::npos : end - start));
-}
-
-std::string envVar(const wchar_t* name) {
-    wchar_t buf[4096] = {};
-    const DWORD n = GetEnvironmentVariableW(name, buf, 4096);
-    if (n == 0 || n >= 4096) return {};
-    std::string v = toUtf8(std::wstring_view(buf, n));
-    while (!v.empty() && (v.back() == ' ' || v.back() == '\r' || v.back() == '\n')) v.pop_back();
-    while (!v.empty() && v.front() == ' ') v.erase(0, 1);
-    return v;
 }
 
 std::vector<std::string> apiHeaders(const std::string& token, const char* accept) {
@@ -135,7 +140,7 @@ bool findChecksum(const std::string& sumsText, const std::string& fileName, std:
         if (name < line.size() && line[name] == '*') ++name;   // binary-mode marker
         const std::string entry = line.substr(name);
 
-        if (_stricmp(entry.c_str(), fileName.c_str()) == 0) {
+        if (equalsNoCase(entry, fileName)) {
             const std::string h = lower(line.substr(0, 64));
             // Two different sums for one file means the file cannot be trusted.
             if (matches > 0 && h != hexOut) { hexOut.clear(); return false; }
@@ -147,41 +152,15 @@ bool findChecksum(const std::string& sumsText, const std::string& fileName, std:
 }
 
 std::string sha256Hex(const void* data, size_t size) {
-    BCRYPT_ALG_HANDLE  alg  = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    unsigned char digest[32] = {};
-    bool ok = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0 &&
-              BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) == 0;
-    // BCryptHashData takes a ULONG; feed large inputs in pieces.
-    const auto* p = static_cast<const unsigned char*>(data);
-    size_t left = size;
-    while (ok && left > 0) {
-        const ULONG chunk = static_cast<ULONG>(left > (1u << 30) ? (1u << 30) : left);
-        ok = BCryptHashData(hash, const_cast<PUCHAR>(p), chunk, 0) == 0;
-        p += chunk;
-        left -= chunk;
-    }
-    ok = ok && BCryptFinishHash(hash, digest, sizeof digest, 0) == 0;
-    if (hash) BCryptDestroyHash(hash);
-    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
-    if (!ok) return {};
-
-    static const char* kHex = "0123456789abcdef";
-    std::string out;
-    for (unsigned char c : digest) { out += kHex[c >> 4]; out += kHex[c & 15]; }
-    return out;
+    uint8_t digest[32] = {};
+    if (!sha256(data, size, digest)) return {};
+    return toHex(digest, sizeof digest);
 }
 
 bool sha256File(const std::string& path, std::string& hexOut) {
     hexOut.clear();
-    HANDLE f = CreateFileW(toUtf16(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return false;
     std::string data;
-    char buf[65536];
-    DWORD got = 0;
-    while (ReadFile(f, buf, sizeof buf, &got, nullptr) && got > 0) data.append(buf, got);
-    CloseHandle(f);
+    if (!readFileBytes(path, data)) return false;
     hexOut = sha256Hex(data.data(), data.size());
     return !hexOut.empty();
 }
@@ -210,6 +189,7 @@ const char* describeTokenKind(TokenKind kind) {
     return "token";
 }
 
+#if defined(_WIN32)
 bool protectSecret(const std::string& plain, std::string& blob) {
     DATA_BLOB in{static_cast<DWORD>(plain.size()),
                  reinterpret_cast<BYTE*>(const_cast<char*>(plain.data()))};
@@ -253,14 +233,8 @@ bool saveToken(const std::string& token) {
 bool loadSavedToken(std::string& token) {
     token.clear();
     // Not readStateFile: that trims whitespace, which would corrupt a binary blob.
-    HANDLE f = CreateFileW(toUtf16(tokenFilePath()).c_str(), GENERIC_READ, FILE_SHARE_READ,
-                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return false;
     std::string blob;
-    char buf[4096];
-    DWORD got = 0;
-    while (ReadFile(f, buf, sizeof buf, &got, nullptr) && got > 0) blob.append(buf, got);
-    CloseHandle(f);
+    if (!readFileBytes(tokenFilePath(), blob)) return false;
     return !blob.empty() && unprotectSecret(blob, token) && !token.empty();
 }
 
@@ -268,18 +242,38 @@ bool forgetSavedToken() {
     return DeleteFileW(toUtf16(tokenFilePath()).c_str()) != FALSE;
 }
 
+#else
+// The macOS counterpart of a DPAPI blob is the user's login Keychain: stored
+// encrypted, unlocked with the user's session, never written in clear to disk.
+std::string tokenFilePath() { return "the login Keychain (service \"soi-share\")"; }
+
+bool saveToken(const std::string& token) {
+    return keychainStore(kTokenAccount, token);
+}
+
+bool loadSavedToken(std::string& token) {
+    token.clear();
+    return keychainLoad(kTokenAccount, token) && !token.empty();
+}
+
+bool forgetSavedToken() {
+    return keychainDelete(kTokenAccount);
+}
+
+#endif
+
 TokenChoice tokenFromEnvironmentOrStore() {
     TokenChoice c;
-    if (auto t = envVar(L"SOI_SHARE_GITHUB_TOKEN"); !t.empty()) {
+    if (auto t = envVar("SOI_SHARE_GITHUB_TOKEN"); !t.empty()) {
         c.token    = t;
         c.source   = "SOI_SHARE_GITHUB_TOKEN";
         c.saveable = classifyToken(t) == TokenKind::FineGrained;
         return c;
     }
-    for (const wchar_t* name : {L"GH_TOKEN", L"GITHUB_TOKEN"}) {
+    for (const char* name : {"GH_TOKEN", "GITHUB_TOKEN"}) {
         if (auto t = envVar(name); !t.empty()) {
             c.token  = t;
-            c.source = toUtf8(name);
+            c.source = name;
             return c;
         }
     }
@@ -290,6 +284,7 @@ TokenChoice tokenFromEnvironmentOrStore() {
     return c;
 }
 
+#if defined(_WIN32)
 bool promptHidden(const char* prompt, std::string& out) {
     out.clear();
     HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
@@ -315,8 +310,39 @@ bool promptHidden(const char* prompt, std::string& out) {
     return !out.empty();
 }
 
+#else
+bool promptHidden(const char* prompt, std::string& out) {
+    out.clear();
+    if (!isatty(STDIN_FILENO)) return false;
+
+    termios saved{};
+    if (tcgetattr(STDIN_FILENO, &saved) != 0) return false;
+    termios quiet = saved;
+    quiet.c_lflag &= ~static_cast<tcflag_t>(ECHO);
+    quiet.c_lflag |= ICANON;
+
+    std::fputs(prompt, stdout);
+    std::fflush(stdout);
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &quiet);
+    std::string line;
+    const bool ok = static_cast<bool>(std::getline(std::cin, line));
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved);
+    std::fputs("\n", stdout);
+    if (!ok) return false;
+
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
+        line.pop_back();
+    while (!line.empty() && line.front() == ' ') line.erase(0, 1);
+    out = line;
+    std::fill(line.begin(), line.end(), '\0');
+    return !out.empty();
+}
+
+#endif
+
 // --- HTTP -------------------------------------------------------------------
 
+#if defined(_WIN32)
 HttpResponse httpGet(const std::string& url, const std::vector<std::string>& headers,
                      bool followRedirects) {
     HttpResponse r;
@@ -415,11 +441,37 @@ HttpResponse httpGet(const std::string& url, const std::vector<std::string>& hea
     return r;
 }
 
+#else
+HttpResponse httpGet(const std::string& url, const std::vector<std::string>& headers,
+                     bool followRedirects) {
+    HttpResponse r;
+    CurlRequest req;
+    req.url              = url;
+    req.headers          = headers;
+    req.connectTimeoutMs = 15000;
+    req.totalTimeoutMs   = 10 * 60 * 1000;   // a release download on a slow link
+    req.followRedirects  = followRedirects;
+    req.maxBytes         = kMaxDownloadBytes;
+    req.userAgent        = std::string("soi-share/") + SOI_VERSION;
+
+    CurlResponse c = curlPerform(req);
+    if (!c.transportOk) {
+        r.error = "could not reach " + hostOf(url) + ": " + c.error;
+        return r;
+    }
+    r.status   = c.status;
+    r.body     = std::move(c.body);
+    r.location = std::move(c.location);
+    return r;
+}
+
+#endif
+
 // --- releases ---------------------------------------------------------------
 
 const ReleaseAsset* Release::asset(const std::string& name) const {
     for (const auto& a : assets)
-        if (_stricmp(a.name.c_str(), name.c_str()) == 0) return &a;
+        if (equalsNoCase(a.name, name)) return &a;
     return nullptr;
 }
 

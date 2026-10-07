@@ -21,11 +21,16 @@ concurrency:
   group: release-${{ github.ref }}-${{ inputs.tag }}
   cancel-in-progress: false
 
+env:
+  TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+
 jobs:
-  build:
+  # ---------------------------------------------------------------------------
+  # Windows: soi-share.exe
+  # ---------------------------------------------------------------------------
+  windows:
     runs-on: windows-latest
     env:
-      TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
       VCPKG_ROOT_DIR: C:\vcpkg
     steps:
       - uses: actions/checkout@v4
@@ -89,6 +94,11 @@ jobs:
           .\build\Release\soi-selftest.exe unit
           if ($LASTEXITCODE -ne 0) { throw "unit tests failed" }
 
+      - name: Signalling interop with the viewer's WebCrypto format
+        run: |
+          node tests\interop.js build\Release\soi-selftest.exe
+          if ($LASTEXITCODE -ne 0) { throw "interop tests failed" }
+
       - name: Only Windows DLLs
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\check-dlls.ps1 build\Release\soi-share.exe
@@ -104,16 +114,208 @@ jobs:
           powershell -NoProfile -ExecutionPolicy Bypass -File tests\packaging-smoke.ps1 -Exe build\Release\soi-share.exe -ExpectVersion $env:VERSION -Isolated
           if ($LASTEXITCODE -ne 0) { throw "packaging smoke test failed" }
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: build/Release/soi-share.exe
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # macOS: soi-share-macos.zip -- one universal binary (Apple silicon + Intel),
+  # macOS 10.15 and later, runnable straight from the folder it is unzipped to.
+  # ---------------------------------------------------------------------------
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version from the tag
+        run: |
+          if [ -n "$TAG" ]; then
+            if ! [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]*)?)$ ]]; then
+              echo "tag '$TAG' is not of the form v1.2.3"; exit 1
+            fi
+            version="${BASH_REMATCH[1]}"
+          else
+            version="0.0.0-dev.$GITHUB_RUN_NUMBER"
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "building soi-share $version"
+          sw_vers; uname -m; xcodebuild -version
+
+      # OpenSSL again, once per architecture, built static and for the same
+      # minimum macOS as the binary (tools/vcpkg-triplets).
+      - name: vcpkg
+        id: vcpkg
+        run: |
+          if [ -n "$VCPKG_INSTALLATION_ROOT" ] && [ -x "$VCPKG_INSTALLATION_ROOT/vcpkg" ]; then
+            root="$VCPKG_INSTALLATION_ROOT"
+          else
+            root="$HOME/vcpkg"
+            git clone --depth 1 https://github.com/microsoft/vcpkg "$root"
+            "$root/bootstrap-vcpkg.sh" -disableMetrics
+          fi
+          echo "VCPKG_ROOT_DIR=$root" >> "$GITHUB_ENV"
+          rev=$(git -C "$root" rev-parse --short HEAD)
+          echo "key=vcpkg-openssl-osx-soi-$ImageOS-$rev-${{ hashFiles('tools/vcpkg-triplets/*') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore vcpkg packages
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.VCPKG_ROOT_DIR }}/installed
+          key: ${{ steps.vcpkg.outputs.key }}
+
+      - name: Install OpenSSL (static, arm64 + x86_64)
+        run: |
+          "$VCPKG_ROOT_DIR/vcpkg" install openssl:arm64-osx-soi openssl:x64-osx-soi \
+            --overlay-triplets="$PWD/tools/vcpkg-triplets"
+
+      - name: Save vcpkg packages
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.VCPKG_ROOT_DIR }}/installed
+          key: ${{ steps.vcpkg.outputs.key }}
+
+      # One build per architecture, then lipo: the dependencies (OpenSSL above,
+      # libdatachannel's bundled C libraries) each build for one arch at a time.
+      - name: Configure and build (arm64, x86_64)
+        run: |
+          for arch in arm64 x86_64; do
+            triplet=$([ "$arch" = arm64 ] && echo arm64-osx-soi || echo x64-osx-soi)
+            cmake -S . -B "build-$arch" -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_ARCHITECTURES="$arch" \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
+              -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT_DIR/scripts/buildsystems/vcpkg.cmake" \
+              -DVCPKG_TARGET_TRIPLET="$triplet" \
+              -DVCPKG_OVERLAY_TRIPLETS="$PWD/tools/vcpkg-triplets" \
+              -DSOI_VERSION="$VERSION" \
+              -DSOI_GITHUB_REPO="${{ github.repository }}"
+            cmake --build "build-$arch" --parallel "$(sysctl -n hw.ncpu)"
+          done
+
+      - name: Unit tests (Apple silicon)
+        run: build-arm64/soi-selftest unit
+
+      # The Intel slice, run under Rosetta: the same tests on the other CPU,
+      # including its SSSE3 colour conversion and VideoToolbox from x86_64.
+      - name: Unit tests (Intel, under Rosetta)
+        run: |
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            arch -x86_64 build-x86_64/soi-selftest unit
+          else
+            echo "::warning::Rosetta is not available on this runner; the x86_64 slice was built but not run"
+          fi
+
+      - name: Signalling interop with the viewer's WebCrypto format
+        run: node tests/interop.js build-arm64/soi-selftest
+
+      - name: Universal binary
+        run: |
+          mkdir -p dist/soi-share
+          lipo -create build-arm64/soi-share build-x86_64/soi-share -output dist/soi-share/soi-share
+          # Apple silicon refuses to run unsigned code at all; an ad-hoc
+          # signature is what every locally built binary has, and is enough.
+          codesign --force --sign - --timestamp=none dist/soi-share/soi-share
+          codesign --verify --verbose dist/soi-share/soi-share
+          lipo -archs dist/soi-share/soi-share
+
+      # The macOS counterpart of tools/check-dlls.ps1: the binary must need
+      # nothing that is not part of macOS, and must run on 10.15 (Intel) and
+      # 11.0 (Apple silicon), whatever this runner's SDK is.
+      - name: Only system libraries, both architectures, minimum macOS
+        run: tools/check-macos-binary.sh dist/soi-share/soi-share
+
+      - name: Version stamp and embedded files
+        run: |
+          bin=dist/soi-share/soi-share
+          v=$("$bin" version --short)
+          [ "$v" = "$VERSION" ] || { echo "binary reports '$v', expected '$VERSION'"; exit 1; }
+          arch -x86_64 "$bin" version --short 2>/dev/null || true
+          "$bin" licenses | head -3 | grep -q "Third-party notices"
+          "$bin" help | grep -q "QUICK START"
+
+      # What a runner can show of capture: displays, the permission state, and
+      # every backend probed. Reported, not enforced: hosted runners may not
+      # grant Screen Recording to the job.
+      - name: Capture report
+        continue-on-error: true
+        run: |
+          bin=dist/soi-share/soi-share
+          "$bin" list-monitors || true
+          "$bin" capture-check --verbose || true
+          "$bin" gpu-check || true
+          build-arm64/soi-selftest || true
+
+      - name: Detached start / status / stop, and install / uninstall
+        run: tests/macos-smoke.sh dist/soi-share/soi-share "$VERSION"
+
+      # A real viewer: Google Chrome loads the handover page the binary serves,
+      # answers by itself, and must decode live H.264 from it.
+      - name: End to end in Google Chrome
+        env:
+          SOI_SHARE_SKIP_PERMISSION_CHECK: '1'
+        run: |
+          npm install --no-save --no-package-lock playwright-core@1
+          node tests/e2e-viewer.mjs dist/soi-share/soi-share
+
+      - name: Package
+        run: |
+          cp viewer/viewer.html THIRD_PARTY_NOTICES.md dist/soi-share/
+          cp tools/macos-README.txt dist/soi-share/README.txt
+          # ditto keeps the executable bit and the signature intact.
+          (cd dist && ditto -c -k --keepParent soi-share soi-share-macos.zip)
+          unzip -l dist/soi-share-macos.zip
+
+      # Run the zip exactly as a person would: unzip somewhere new, mark it as
+      # downloaded from the internet the way a browser does, clear that mark
+      # as README.txt says, and run it from its own folder.
+      - name: Run the zip from its own folder
+        run: |
+          tmp=$(mktemp -d)
+          cp dist/soi-share-macos.zip "$tmp/"
+          cd "$tmp"
+          xattr -w com.apple.quarantine "0081;$(printf %x "$(date +%s)");Safari;" soi-share-macos.zip
+          ditto -x -k soi-share-macos.zip .
+          cd soi-share
+          ls -l
+          [ -x soi-share ] || { echo "the binary lost its executable bit"; exit 1; }
+          xattr -d com.apple.quarantine soi-share 2>/dev/null || true
+          ./soi-share version
+          ./soi-share help | head -5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/soi-share-macos.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Publish: both platforms' files, one SHA256SUMS.txt, one release.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
       - name: Stage release files
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item build\Release\soi-share.exe, install.ps1, viewer\viewer.html, THIRD_PARTY_NOTICES.md dist\
-          $lines = Get-ChildItem dist -File | Sort-Object Name | ForEach-Object {
-            (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant() + '  ' + $_.Name
-          }
-          # sha256sum format, LF endings, no BOM: `sha256sum -c` accepts it as is.
-          [IO.File]::WriteAllText("$PWD\dist\SHA256SUMS.txt", ($lines -join "`n") + "`n")
-          Get-Content dist\SHA256SUMS.txt
+          set -e
+          if [ -n "$TAG" ]; then version="${TAG#v}"; else version="0.0.0-dev.$GITHUB_RUN_NUMBER"; fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          mkdir -p dist
+          cp artifacts/windows/soi-share.exe artifacts/macos/soi-share-macos.zip dist/
+          cp install.ps1 viewer/viewer.html THIRD_PARTY_NOTICES.md dist/
+          # sha256sum format, LF endings: `sha256sum -c` and `shasum -a 256 -c`
+          # accept it as is, and so do install.ps1 and `soi-share update`.
+          (cd dist && sha256sum $(ls | sort) > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v4
         with:
@@ -125,25 +327,30 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $notes = (Get-Content .github\release-notes.md -Raw).Replace('{{TAG}}', $env:TAG).Replace('{{REPO}}', '${{ github.repository }}')
-          Set-Content -Path notes.md -Value $notes -Encoding utf8
-          $prerelease = @()
-          if ($env:VERSION -match '-') { $prerelease = @('--prerelease') }
-          gh release view $env:TAG *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release edit $env:TAG --title "soi-share $env:TAG" --notes-file notes.md
-          } else {
-            gh release create $env:TAG --target $env:GITHUB_SHA --title "soi-share $env:TAG" --notes-file notes.md @prerelease
-          }
-          if ($LASTEXITCODE -ne 0) { throw "could not create or edit the release" }
+          set -e
+          sed -e "s/{{TAG}}/$TAG/g" -e "s#{{REPO}}#${{ github.repository }}#g" .github/release-notes.md > notes.md
+          prerelease=""
+          case "$VERSION" in *-*) prerelease="--prerelease";; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "soi-share $TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "soi-share $TAG" --notes-file notes.md $prerelease
+          fi
           # --clobber replaces same-named assets, so re-running a tag updates it.
-          gh release upload $env:TAG (Get-ChildItem dist -File).FullName --clobber
-          if ($LASTEXITCODE -ne 0) { throw "could not upload the release files" }
+          gh release upload "$TAG" dist/* --clobber
 
-      # The documented one-liner, in Windows PowerShell 5.1, against what was
-      # just published -- the way a user will run it.
+  # The documented one-liner, in Windows PowerShell 5.1, against what was just
+  # published -- the way a user will run it.
+  verify-windows-install:
+    needs: publish
+    if: github.event_name == 'push' && !contains(github.ref_name, '-') || (inputs.tag != '' && !contains(inputs.tag, '-'))
+    runs-on: windows-latest
+    steps:
+      - name: Version from the tag
+        run: |
+          "VERSION=$($env:TAG.TrimStart('v'))" >> $env:GITHUB_ENV
+
       - name: Verify the published release installs
-        if: env.TAG != '' && !contains(env.VERSION, '-')
         shell: powershell
         env:
           SOI_SHARE_GITHUB_TOKEN: ${{ github.token }}
@@ -153,3 +360,25 @@ jobs:
           $v = (soi-share version --short | Out-String).Trim()
           if ($v -ne $env:VERSION) { throw "installed soi-share reports '$v', expected '$env:VERSION'" }
           soi-share uninstall --purge
+
+  # The macOS updater against what was just published: an older-looking binary
+  # must find the release, verify the zip's checksum, unpack and replace itself.
+  verify-macos-update:
+    needs: publish
+    if: github.event_name == 'push' && !contains(github.ref_name, '-') || (inputs.tag != '' && !contains(inputs.tag, '-'))
+    runs-on: macos-15
+    steps:
+      - name: Update a downloaded copy in place
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOI_SHARE_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          tmp=$(mktemp -d); cd "$tmp"
+          gh release download "$TAG" --repo "${{ github.repository }}" --pattern soi-share-macos.zip
+          ditto -x -k soi-share-macos.zip .
+          cd soi-share
+          ./soi-share version
+          ./soi-share update --check
+          ./soi-share update --force
+          [ "$(./soi-share version --short)" = "${TAG#v}" ]

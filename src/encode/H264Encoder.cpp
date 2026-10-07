@@ -52,26 +52,6 @@ int firstNalType(const uint8_t* p, size_t len) {
 
 } // namespace
 
-// H.264 level selection. Getting this wrong is not cosmetic: a decoder that
-// trusts an under-stated level may refuse the stream or allocate too few DPB
-// slots. Table is (levelIdc, maxMacroblocksPerSecond, maxFrameMacroblocks).
-int h264LevelForResolution(int width, int height, int fps) {
-    struct Level { int idc; long long mbps; long long frameMbs; };
-    static constexpr Level kLevels[] = {
-        {30, 40500,  1620},  {31, 108000, 3600},  {32, 216000, 5120},
-        {40, 245760, 8192},  {41, 245760, 8192},  {42, 522240, 8704},
-        {50, 589824, 22080}, {51, 983040, 36864}, {52, 2073600, 36864},
-    };
-
-    const long long frameMbs =
-        static_cast<long long>((width + 15) / 16) * ((height + 15) / 16);
-    const long long mbps = frameMbs * (fps > 0 ? fps : 30);
-
-    for (const auto& l : kLevels)
-        if (frameMbs <= l.frameMbs && mbps <= l.mbps) return l.idc;
-    return 52;
-}
-
 // ---------------------------------------------------------------------------
 
 H264Encoder::H264Encoder()  = default;

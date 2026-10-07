@@ -1,8 +1,28 @@
 #include "app/Service.h"
 #include "util/Log.h"
-#include "util/Win.h"
+#include "util/Platform.h"
 
-#include <windows.h>
+#if defined(_WIN32)
+  #include "util/Win.h"
+  #include <windows.h>
+#else
+  #include <dirent.h>
+  #include <fcntl.h>
+  #include <pwd.h>
+  #include <spawn.h>
+  #include <sys/file.h>
+  #include <sys/stat.h>
+  #include <unistd.h>
+  #if defined(__APPLE__)
+    #include <mach-o/dyld.h>
+  #endif
+  #include <atomic>
+  #include <cerrno>
+  #include <climits>
+  #include <cstdlib>
+  #include <cstring>
+extern char** environ;
+#endif
 
 #include <chrono>
 #include <mutex>
@@ -11,11 +31,22 @@
 namespace soi {
 namespace {
 
+#if defined(_WIN32)
 constexpr wchar_t kInstanceMutex[] = L"Local\\soi-share-instance";
 constexpr wchar_t kStopEventName[] = L"Local\\soi-share-stop";
 
 HANDLE g_instanceMutex = nullptr;
 HANDLE g_stopEvent     = nullptr;
+#else
+// The lock is an flock() on a file in the state folder: the kernel drops it
+// when the process exits, however it exits, so a crash never leaves a stale
+// lock behind.
+int               g_lockFd = -1;
+// No 1.0.x builds ever ran on this platform, so the stop "event" only has to
+// work within this process; other processes ask over the control channel.
+std::atomic<bool> g_stopRequested{false};
+std::atomic<bool> g_stopArmed{false};
+#endif
 
 std::mutex                                       g_liveMutex;
 std::vector<std::pair<std::string, std::string>> g_live;
@@ -59,6 +90,7 @@ DaemonState tokenToStateImpl(const std::string& t) {
 
 } // namespace
 
+#if defined(_WIN32)
 // Quotes an argument for CommandLineToArgvW round-tripping.
 std::wstring quoteArg(const std::string& arg) {
     const std::wstring w = toUtf16(arg);
@@ -81,6 +113,8 @@ std::wstring quoteArg(const std::string& arg) {
     out.push_back(L'"');
     return out;
 }
+
+std::string quoteArgument(const std::string& arg) { return toUtf8(quoteArg(arg)); }
 
 std::string currentExePath() {
     // Long enough for any path Windows will actually run an exe from; a MAX_PATH
@@ -191,6 +225,119 @@ bool purgeState(int& filesRemoved, std::string& note) {
     return true;
 }
 
+#else
+// POSIX shell quoting: single quotes, with any embedded ' closed, escaped and
+// reopened. What comes out is safe to paste into sh/zsh/bash as one word.
+std::string quoteArgument(const std::string& arg) {
+    if (!arg.empty() && arg.find_first_not_of(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_./:=,+@%") ==
+            std::string::npos)
+        return arg;
+    std::string out = "'";
+    for (char c : arg) {
+        if (c == '\'') out += "'\\''";
+        else            out += c;
+    }
+    return out + "'";
+}
+
+std::string currentExePath() {
+#if defined(__APPLE__)
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::string raw(size, '\0');
+    if (_NSGetExecutablePath(raw.data(), &size) != 0) return {};
+    raw.resize(std::strlen(raw.c_str()));
+#else
+    char buf[PATH_MAX] = {};
+    const ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+    if (n <= 0) return {};
+    std::string raw(buf, static_cast<size_t>(n));
+#endif
+    // Absolute and free of symlinks, so it compares equal to what proc_pidpath
+    // reports for the same process.
+    char real[PATH_MAX];
+    return realpath(raw.c_str(), real) ? std::string(real) : raw;
+}
+
+// ---------------------------------------------------------------------------
+
+std::string homeDirectory() {
+    if (std::string home = envVar("HOME"); !home.empty()) return home;
+    if (const passwd* pw = getpwuid(getuid()); pw && pw->pw_dir) return pw->pw_dir;
+    return ".";
+}
+
+std::string stateDirectory() {
+#if defined(__APPLE__)
+    // Where per-user application data lives on a Mac. The folder is created
+    // 0700 so another account on the same machine cannot read the share code.
+    const std::string support = homeDirectory() + "/Library/Application Support";
+    mkdir(support.c_str(), 0700);
+    const std::string dir = support + "/soi-share";
+#else
+    std::string base = envVar("XDG_STATE_HOME");
+    if (base.empty()) {
+        base = homeDirectory() + "/.local";
+        mkdir(base.c_str(), 0700);
+        base += "/state";
+    }
+    mkdir(base.c_str(), 0700);
+    const std::string dir = base + "/soi-share";
+#endif
+    mkdir(dir.c_str(), 0700);
+    return dir;
+}
+
+std::string stateFilePath(const std::string& leaf) {
+    return stateDirectory() + "/" + leaf;
+}
+
+bool writeStateFile(const std::string& leaf, const std::string& contents) {
+    // Write-then-rename so a reader never observes a half-written file.
+    const std::string finalPath = stateFilePath(leaf);
+    const std::string tempPath  = finalPath + ".tmp";
+    if (!writeFileBytes(tempPath, contents)) return false;
+    return std::rename(tempPath.c_str(), finalPath.c_str()) == 0;
+}
+
+bool readStateFile(const std::string& leaf, std::string& contents) {
+    contents.clear();
+    if (!readFileBytes(stateFilePath(leaf), contents)) return false;
+    contents = trim(std::move(contents));
+    return true;
+}
+
+bool removeStateFile(const std::string& leaf) {
+    return removeFile(stateFilePath(leaf));
+}
+
+bool purgeState(int& filesRemoved, std::string& note) {
+    filesRemoved = 0;
+    const std::string dir = stateDirectory();
+
+    // Enumerate rather than delete a fixed list: this must also catch the .tmp
+    // spill files write-then-rename can leave behind, the machine.code, and
+    // anything a future version writes without this code being told about it.
+    if (DIR* d = opendir(dir.c_str())) {
+        while (const dirent* e = readdir(d)) {
+            const std::string name = e->d_name;
+            if (name == "." || name == "..") continue;
+            const std::string full = dir + "/" + name;
+            if (fileExists(full) && removeFile(full)) ++filesRemoved;
+        }
+        closedir(d);
+    }
+    // Best-effort, as on Windows: the sensitive contents are already gone.
+    rmdir(dir.c_str());
+
+    note = filesRemoved ? soi::format("removed {} file(s) from {}", filesRemoved, dir)
+                        : "nothing to remove; no SOI state on disk";
+    return true;
+}
+
+#endif
+
 void setLive(const std::string& key, const std::string& value) {
     // Single-line by contract: the control channel is one key=value per line.
     std::string clean = value;
@@ -260,6 +407,7 @@ std::string describeState(DaemonState state) {
 
 // ---------------------------------------------------------------------------
 
+#if defined(_WIN32)
 bool acquireInstanceLock() {
     g_instanceMutex = CreateMutexW(nullptr, TRUE, kInstanceMutex);
     if (!g_instanceMutex) return false;
@@ -380,5 +528,100 @@ unsigned long spawnDetached(const std::vector<std::string>& args) {
     CloseHandle(pi.hProcess);
     return pid;
 }
+
+#else
+bool acquireInstanceLock() {
+    const std::string path = stateFilePath("instance.lock");
+    const int fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return false;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return false;
+    }
+    g_lockFd = fd;   // held, deliberately, until the process exits
+    return true;
+}
+
+bool legacyDaemonRunning(unsigned long* /*pidOut*/) {
+    return false;   // there was never a 1.0.x build for this platform
+}
+
+// ---------------------------------------------------------------------------
+
+bool createStopEvent() {
+    g_stopRequested.store(false);   // a stale set state would stop us instantly
+    g_stopArmed.store(true);
+    return true;
+}
+
+bool stopRequested() { return g_stopArmed.load() && g_stopRequested.load(); }
+
+void requestStop() {
+    if (g_stopArmed.load()) g_stopRequested.store(true);
+}
+
+bool signalStop() { return false; }   // other processes use the control channel
+
+void closeStopEvent() { g_stopArmed.store(false); }
+
+// ---------------------------------------------------------------------------
+
+unsigned long spawnDetached(const std::vector<std::string>& args) {
+    const std::string exe = currentExePath();
+    std::vector<std::string> owned;
+    owned.push_back(exe);
+    owned.insert(owned.end(), args.begin(), args.end());
+    std::vector<char*> argv;
+    for (auto& a : owned) argv.push_back(a.data());
+    argv.push_back(nullptr);
+
+    // A new session (setsid) means no controlling terminal: closing the window
+    // that ran `start` sends SIGHUP to that terminal's session, and this child
+    // is not in it. stdio goes to /dev/null -- the child logs to its file.
+    //
+    // The working directory is the state folder, not the caller's, so a
+    // long-lived share never pins whatever folder `start` was typed in.
+    const std::string cwd = stateDirectory();
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    short flags = 0;
+#if defined(POSIX_SPAWN_SETSID)
+    flags |= POSIX_SPAWN_SETSID;
+#endif
+#if defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
+    // Nothing of ours -- the instance lock, a socket -- leaks into the child.
+    flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
+#endif
+    posix_spawnattr_setflags(&attr, flags);
+
+    // posix_spawn has no working-directory attribute before macOS 26, so the
+    // directory is changed around the call. This runs on the main thread of a
+    // short-lived `start` command with no other threads alive.
+    char previous[PATH_MAX] = {};
+    const bool havePrevious = getcwd(previous, sizeof previous) != nullptr;
+    const bool moved = chdir(cwd.c_str()) == 0;
+
+    pid_t pid = 0;
+    const int rc = posix_spawn(&pid, exe.c_str(), &actions, &attr, argv.data(), environ);
+
+    if (moved && havePrevious) (void)chdir(previous);
+    posix_spawnattr_destroy(&attr);
+    posix_spawn_file_actions_destroy(&actions);
+
+    if (rc != 0) {
+        logE("could not start the background process: {}", std::strerror(rc));
+        return 0;
+    }
+    return static_cast<unsigned long>(pid);
+}
+
+#endif
 
 } // namespace soi

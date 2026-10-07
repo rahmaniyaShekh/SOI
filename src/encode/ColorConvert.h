@@ -50,7 +50,11 @@ inline void bgraToNv12(const uint8_t* src, int srcStride, int width, int height,
     bgraToNv12(src, srcStride, width, height, width & ~1, height & ~1, dst);
 }
 
-// True if the SSSE3 fast path is in use on this CPU (else a scalar fallback).
+// True if a SIMD fast path is in use on this CPU -- SSSE3 on x86, NEON on ARM
+// -- rather than the scalar fallback.
 bool colorConvertUsesSimd();
+
+// "SSSE3", "NEON" or "scalar", for logs.
+const char* colorConvertSimdName();
 
 } // namespace soi

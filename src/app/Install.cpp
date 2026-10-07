@@ -65,11 +65,6 @@ std::string fullPath(const std::string& p) {
     return toUtf8(out);
 }
 
-std::string directoryOf(const std::string& path) {
-    const size_t slash = path.find_last_of("\\/");
-    return slash == std::string::npos ? std::string(".") : path.substr(0, slash);
-}
-
 std::string lastErrorText() {
     return hrString(static_cast<long>(HRESULT_FROM_WIN32(GetLastError())));
 }
@@ -223,6 +218,42 @@ void broadcastEnvironmentChange() {
     SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
                         reinterpret_cast<LPARAM>(L"Environment"),
                         SMTO_ABORTIFHUNG, 5000, &result);
+}
+
+bool addToUserPath(const std::string& dir, std::string& report) {
+    std::string value, error;
+    bool exists = false;
+    if (!readUserPath(value, exists, error)) { report = error; return false; }
+
+    const int present = pathListCount(value, dir);
+    if (present == 1) { report = "already on your PATH"; return true; }
+
+    std::string next = value;
+    if (present > 1) {   // tidy duplicates an older installer left behind
+        int removed = 0;
+        next = pathListRemove(next, dir, removed);
+    }
+    bool changed = false;
+    next = pathListAdd(next, dir, changed);
+    if (!writeUserPath(next, error)) { report = error; return false; }
+    broadcastEnvironmentChange();
+    report = present > 1 ? "on your PATH (removed duplicate entries)" : "added to your PATH";
+    return true;
+}
+
+bool removeFromUserPath(const std::string& dir, bool& removed, std::string& report) {
+    removed = false;
+    std::string value, error;
+    bool exists = false;
+    if (!readUserPath(value, exists, error)) { report = "could not read: " + error; return false; }
+    int count = 0;
+    const std::string next = pathListRemove(value, dir, count);
+    if (!count) { report = "nothing to remove"; return true; }
+    if (!writeUserPath(next, error)) { report = "could not update: " + error; return false; }
+    broadcastEnvironmentChange();
+    removed = true;
+    report = "removed " + dir;
+    return true;
 }
 
 // --- files ------------------------------------------------------------------

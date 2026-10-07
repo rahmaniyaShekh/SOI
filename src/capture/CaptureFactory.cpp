@@ -1,8 +1,13 @@
 #include "capture/CaptureFactory.h"
-#include "capture/BitBltCapture.h"
-#include "capture/DxgiCapture.h"
-#include "capture/WgcCapture.h"
 #include "util/Log.h"
+
+#if defined(_WIN32)
+  #include "capture/BitBltCapture.h"
+  #include "capture/DxgiCapture.h"
+  #include "capture/WgcCapture.h"
+#else
+  #include "capture/mac/MacCapture.h"
+#endif
 
 #include <chrono>
 #include <map>
@@ -17,6 +22,7 @@ using Clock = std::chrono::steady_clock;
 // as the user takes to read it, and changing backend would not help.
 constexpr auto kFailureGrace = std::chrono::seconds(3);
 
+#if defined(_WIN32)
 std::unique_ptr<FrameSource> makeBackend(CaptureBackend backend, const CaptureConfig& cfg) {
     CaptureConfig c = cfg;
     c.backend = backend;
@@ -37,6 +43,40 @@ std::vector<CaptureBackend> preferenceOrder(const CaptureConfig& cfg) {
 
     return {CaptureBackend::Dxgi, CaptureBackend::Wgc, CaptureBackend::BitBlt};
 }
+
+constexpr CaptureBackend kAllBackends[] = {CaptureBackend::Dxgi, CaptureBackend::Wgc,
+                                           CaptureBackend::BitBlt};
+#else
+std::unique_ptr<FrameSource> makeBackend(CaptureBackend backend, const CaptureConfig& cfg) {
+    CaptureConfig c = cfg;
+    c.backend = backend;
+    switch (backend) {
+        case CaptureBackend::Sck:     return std::make_unique<SckCapture>(c);
+        case CaptureBackend::Stream:  return std::make_unique<StreamCapture>(c);
+        case CaptureBackend::CgImage: return std::make_unique<CgImageCapture>(c);
+        case CaptureBackend::Auto:    break;
+    }
+    return nullptr;
+}
+
+// ScreenCaptureKit first wherever it exists: compositor-driven, GPU-resident,
+// windows as well as displays. CGDisplayStream is the display reader for
+// macOS before 12.3, and CGImage the floor -- and the only one that composes
+// every display into one picture, so --desktop goes straight to it.
+std::vector<CaptureBackend> preferenceOrder(const CaptureConfig& cfg) {
+    if (cfg.backend != CaptureBackend::Auto) return {cfg.backend};
+
+    if (cfg.target == CaptureTarget::Window)
+        return {CaptureBackend::Sck, CaptureBackend::CgImage};
+    if (cfg.target == CaptureTarget::VirtualDesktop)
+        return {CaptureBackend::CgImage};
+
+    return {CaptureBackend::Sck, CaptureBackend::Stream, CaptureBackend::CgImage};
+}
+
+constexpr CaptureBackend kAllBackends[] = {CaptureBackend::Sck, CaptureBackend::Stream,
+                                           CaptureBackend::CgImage};
+#endif
 
 // After a backend fails to start or dies, it is not tried again until this has
 // passed. Long enough that a persistently-broken backend (a hybrid-GPU machine
@@ -221,19 +261,29 @@ std::unique_ptr<FrameSource> createFrameSource(const CaptureConfig& cfg) {
 }
 
 std::vector<BackendReport> probeBackends(const CaptureConfig& cfg) {
-    const CaptureBackend all[] = {CaptureBackend::Dxgi, CaptureBackend::Wgc,
-                                  CaptureBackend::BitBlt};
-
     std::vector<BackendReport> out;
-    for (CaptureBackend backend : all) {
+    for (CaptureBackend backend : kAllBackends) {
         BackendReport r;
         r.backend = backend;
 
+#if defined(_WIN32)
         if (backend == CaptureBackend::Dxgi && cfg.target == CaptureTarget::Window) {
             r.detail = "not applicable: duplication cannot address a window";
             out.push_back(std::move(r));
             continue;
         }
+#else
+        if (backend == CaptureBackend::Stream && cfg.target != CaptureTarget::Monitor) {
+            r.detail = "not applicable: CGDisplayStream reads one display";
+            out.push_back(std::move(r));
+            continue;
+        }
+        if (backend == CaptureBackend::Sck && cfg.target == CaptureTarget::VirtualDesktop) {
+            r.detail = "not applicable: a ScreenCaptureKit stream reads one display";
+            out.push_back(std::move(r));
+            continue;
+        }
+#endif
 
         CaptureConfig c = cfg;
         c.backend = backend;
@@ -242,6 +292,8 @@ std::vector<BackendReport> probeBackends(const CaptureConfig& cfg) {
         // the compositor and answer in microseconds; GDI has to re-read and hash
         // the whole screen to find out, which is the 16 ms.
         c.detectDuplicates = true;
+        // The probe inspects pixels, so it wants them in system memory.
+        c.preferGpu = false;
 
         auto source = makeBackend(backend, c);
         if (!source || !source->start()) {

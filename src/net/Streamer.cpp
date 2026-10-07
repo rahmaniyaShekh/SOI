@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <format>
 
 namespace soi {
 namespace {

@@ -38,12 +38,20 @@
 // asserts: every entry point reports failure and the caller uses the CPU path.
 // --gpu turns that silence into a hard error, for when you want to know.
 //
-#include "util/Win.h"
-
+// macOS has the same three stages -- ScreenCaptureKit's IOSurface, a
+// VTPixelTransferSession that scales and converts it to NV12 on the GPU, and a
+// VideoToolbox encoder that takes the result directly -- declared in
+// gpu/GpuPipelineMac.h with the same class names, so the session code is
+// shared.
+//
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
+
+#if defined(_WIN32)
+#include "util/Win.h"
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
@@ -55,6 +63,7 @@ struct ID3D11Buffer;
 struct ID3D11RenderTargetView;
 struct ID3D11ShaderResourceView;
 struct IDXGIAdapter1;
+#endif
 
 namespace soi {
 
@@ -72,6 +81,8 @@ enum class Pipeline {
 
 const char* pipelineName(Pipeline p);
 bool        parsePipelineName(std::string_view name, Pipeline& out);
+
+#if defined(_WIN32)
 
 // ---------------------------------------------------------------------------
 // One D3D11 device, shared by the duplication, the NV12 shader and the encoder.
@@ -180,4 +191,10 @@ private:
     int                              srcW_ = 0, srcH_ = 0;
 };
 
+#endif // _WIN32
+
 } // namespace soi
+
+#if !defined(_WIN32)
+#include "gpu/GpuPipelineMac.h"
+#endif

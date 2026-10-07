@@ -1,7 +1,13 @@
 #include "util/Log.h"
-#include "util/Win.h"
 
-#include <windows.h>
+#if defined(_WIN32)
+  #include "util/Win.h"
+  #include <windows.h>
+#else
+  #include <cstdlib>
+  #include <cstring>
+  #include <unistd.h>
+#endif
 #include <cstdio>
 #include <mutex>
 #include <atomic>
@@ -15,6 +21,7 @@ std::mutex        g_mutex;
 std::string       g_logPath;
 FILE*             g_logFile = nullptr;
 
+#if defined(_WIN32)
 // Windows consoles do not enable VT sequences by default; do it once, and fall
 // back to uncoloured output if the handle refuses.
 bool enableVirtualTerminal() {
@@ -24,6 +31,14 @@ bool enableVirtualTerminal() {
     if (!GetConsoleMode(h, &mode)) return false;
     return SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != FALSE;
 }
+#else
+// Colour only for a real terminal; a log redirected to a file stays plain.
+bool enableVirtualTerminal() {
+    if (!isatty(STDERR_FILENO)) return false;
+    const char* term = std::getenv("TERM");
+    return !(term && std::strcmp(term, "dumb") == 0);
+}
+#endif
 
 const bool g_vt = enableVirtualTerminal();
 
@@ -70,7 +85,11 @@ void logSetFile(const std::string& path, bool truncate) {
     // the stream into wide orientation, after which every narrow fprintf below
     // silently writes nothing and the log contains only a BOM. Our strings are
     // already UTF-8, so raw bytes are exactly what we want.
+#if defined(_WIN32)
     g_logFile = _wfopen(toUtf16(path).c_str(), truncate ? L"wb" : L"ab");
+#else
+    g_logFile = std::fopen(path.c_str(), truncate ? "wb" : "ab");
+#endif
 }
 
 void logWrite(LogLevel lvl, std::string_view msg) {
@@ -89,6 +108,14 @@ void logWrite(LogLevel lvl, std::string_view msg) {
 }
 
 std::string hrString(long hr) {
+#if !defined(_WIN32)
+    // On macOS the codes passed here are OSStatus values from VideoToolbox,
+    // CoreMedia or ScreenCaptureKit; there is no system table to look them up
+    // in, so show the number both ways for searching.
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "%ld (0x%08lX)", hr, static_cast<unsigned long>(hr));
+    return buf;
+#else
     char* text = nullptr;
     const DWORD n = FormatMessageA(
         FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
@@ -109,6 +136,7 @@ std::string hrString(long hr) {
     std::snprintf(buf, sizeof buf, "0x%08lX", static_cast<unsigned long>(hr));
     return detail.empty() ? std::string(buf)
                           : std::string(buf) + " (" + detail + ")";
+#endif
 }
 
 } // namespace soi

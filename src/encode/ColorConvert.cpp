@@ -1,9 +1,28 @@
 #include "encode/ColorConvert.h"
 #include "util/Parallel.h"
 
-#include <emmintrin.h>   // SSE2
-#include <tmmintrin.h>   // SSSE3 (_mm_hadd_epi32)
-#include <intrin.h>
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+  #define SOI_X86 1
+  #include <emmintrin.h>   // SSE2
+  #include <tmmintrin.h>   // SSSE3 (_mm_hadd_epi32)
+  #if defined(_MSC_VER)
+    #include <intrin.h>
+  #else
+    #include <cpuid.h>
+  #endif
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  #define SOI_NEON 1
+  #include <arm_neon.h>
+#endif
+
+// GCC and Clang only emit SSSE3 instructions in a function that asks for them;
+// the binary as a whole still targets baseline x86-64, and the CPU is checked
+// at run time before this path is taken. MSVC needs no such annotation.
+#if defined(SOI_X86) && !defined(_MSC_VER)
+  #define SOI_TARGET_SSSE3 __attribute__((target("ssse3")))
+#else
+  #define SOI_TARGET_SSSE3
+#endif
 
 #include <algorithm>
 #include <cstring>
@@ -33,15 +52,27 @@ inline uint8_t clampByte(int v) {
     return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
 }
 
+#if defined(SOI_X86)
 bool detectSsse3() {
+#if defined(_MSC_VER)
     int info[4] = {0, 0, 0, 0};
     __cpuid(info, 0);
     if (info[0] < 1) return false;
     __cpuid(info, 1);
     return (info[2] & (1 << 9)) != 0;   // ECX bit 9 = SSSE3
+#else
+    unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
+    if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx)) return false;
+    return (ecx & (1u << 9)) != 0;      // ECX bit 9 = SSSE3
+#endif
 }
 
 const bool g_ssse3 = detectSsse3();
+#elif defined(SOI_NEON)
+const bool g_ssse3 = false;   // NEON is part of every ARMv8 CPU; see yRowNeon
+#else
+const bool g_ssse3 = false;
+#endif
 
 // ---------------------------------------------------------------------------
 // Y plane, 4 pixels per iteration.
@@ -52,6 +83,8 @@ const bool g_ssse3 = detectSsse3();
 // madd are safe, and the largest partial product (255 * 20128) stays well
 // inside 32 bits.
 // ---------------------------------------------------------------------------
+#if defined(SOI_X86)
+SOI_TARGET_SSSE3
 void yRowSimd(const uint8_t* src, uint8_t* dstY, int width) {
     const __m128i zero   = _mm_setzero_si128();
     // BGRA order in memory -> coefficients must be laid out B, G, R, A.
@@ -86,6 +119,40 @@ void yRowSimd(const uint8_t* src, uint8_t* dstY, int width) {
         dstY[x] = clampByte((kYR * r + kYG * g + kYB * b + kYOffset) >> kShift);
     }
 }
+#endif
+
+#if defined(SOI_NEON)
+// ---------------------------------------------------------------------------
+// Y plane on ARM NEON, 8 pixels per iteration. vld4 de-interleaves BGRA into
+// four 8-lane planes; the Y coefficients are all positive and below 2^15, so
+// unsigned 16x16->32 multiply-accumulates are exact, and the result is the
+// same Q15 arithmetic as the scalar path, bit for bit.
+// ---------------------------------------------------------------------------
+void yRowNeon(const uint8_t* src, uint8_t* dstY, int width) {
+    const uint32x4_t offset = vdupq_n_u32(static_cast<uint32_t>(kYOffset));
+    int x = 0;
+    for (; x + 8 <= width; x += 8) {
+        const uint8x8x4_t px = vld4_u8(src + x * 4);   // val[0]=B, [1]=G, [2]=R
+        const uint16x8_t b = vmovl_u8(px.val[0]);
+        const uint16x8_t g = vmovl_u8(px.val[1]);
+        const uint16x8_t r = vmovl_u8(px.val[2]);
+
+        uint32x4_t lo = vmlal_n_u16(offset, vget_low_u16(r), kYR);
+        lo = vmlal_n_u16(lo, vget_low_u16(g), kYG);
+        lo = vmlal_n_u16(lo, vget_low_u16(b), kYB);
+        uint32x4_t hi = vmlal_n_u16(offset, vget_high_u16(r), kYR);
+        hi = vmlal_n_u16(hi, vget_high_u16(g), kYG);
+        hi = vmlal_n_u16(hi, vget_high_u16(b), kYB);
+
+        const uint16x8_t y16 = vcombine_u16(vshrn_n_u32(lo, kShift), vshrn_n_u32(hi, kShift));
+        vst1_u8(dstY + x, vqmovn_u16(y16));
+    }
+    for (; x < width; ++x) {
+        const uint8_t b = src[x * 4 + 0], g = src[x * 4 + 1], r = src[x * 4 + 2];
+        dstY[x] = clampByte((kYR * r + kYG * g + kYB * b + kYOffset) >> kShift);
+    }
+}
+#endif
 
 void yRowScalar(const uint8_t* src, uint8_t* dstY, int width) {
     for (int x = 0; x < width; ++x) {
@@ -131,7 +198,13 @@ void convertDirect(const uint8_t* src, int srcStride, int width, int height,
     const int uvStride = dst.stride();
 
     const int rowPairs = height / 2;
+#if defined(SOI_X86)
     auto yFn = g_ssse3 ? yRowSimd : yRowScalar;
+#elif defined(SOI_NEON)
+    auto yFn = yRowNeon;
+#else
+    auto yFn = yRowScalar;
+#endif
 
     // One work item = one 2-row band, so Y and UV for the same band stay on the
     // same core and the source rows are read once while hot in L1/L2.
@@ -244,7 +317,13 @@ void convertScaled(const uint8_t* src, int srcStride, int srcW, int srcH,
 
 } // namespace
 
+#if defined(SOI_NEON)
+bool colorConvertUsesSimd() { return true; }
+const char* colorConvertSimdName() { return "NEON"; }
+#else
 bool colorConvertUsesSimd() { return g_ssse3; }
+const char* colorConvertSimdName() { return g_ssse3 ? "SSSE3" : "scalar"; }
+#endif
 
 void bgraToNv12(const uint8_t* src, int srcStride, int srcWidth, int srcHeight,
                 int dstWidth, int dstHeight, Nv12Buffer& dst) {

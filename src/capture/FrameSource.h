@@ -2,8 +2,10 @@
 //
 // Capture abstraction.
 //
-// Three backends implement it, because no single Windows capture API can see
-// everything that is on the screen:
+// Three backends implement it on each platform, because no single capture API
+// can see everything that is on the screen.
+//
+// Windows:
 //
 //   DxgiCapture   Desktop Duplication. Reads the scanout image the display
 //                 controller is actually showing, so it picks up exclusive
@@ -15,6 +17,17 @@
 //   BitBltCapture GDI. Slowest and blindest, but has no dependencies at all and
 //                 can read an occluded window. The floor everything falls back
 //                 to.
+//
+// macOS:
+//
+//   SckCapture    ScreenCaptureKit (macOS 12.3+). Displays and single windows,
+//                 delivered as GPU-resident IOSurfaces with the cursor drawn by
+//                 the system. The only backend that can feed the GPU pipeline.
+//   StreamCapture CGDisplayStream. Displays only, compositor-driven, and the
+//                 best there is on macOS 10.15 - 12.2.
+//   CgImageCapture CGDisplayCreateImage / CGWindowListCreateImage. Slow, but
+//                 has no requirements beyond the Screen Recording permission.
+//                 The floor everything falls back to.
 //
 // CaptureFactory.h picks between them and re-picks at run time if the chosen one
 // stops producing frames. See README 1.2 for what none of them can do.
@@ -40,8 +53,9 @@ struct Frame {
     bool           duplicate = false; // pixel-identical to the previous frame
 
     // On the GPU pipeline the pixels never come back to the CPU: `data` is null
-    // and this is a BGRA ID3D11Texture2D on the shared device instead, valid
-    // until the next capture() call. See gpu/GpuPipeline.h.
+    // and this is a BGRA ID3D11Texture2D on the shared device (Windows) or a
+    // BGRA IOSurface-backed CVPixelBufferRef (macOS) instead, valid until the
+    // next capture() call. See gpu/GpuPipeline.h.
     void*          gpuTexture = nullptr;
 };
 
@@ -50,13 +64,17 @@ enum class CaptureTarget { VirtualDesktop, Monitor, Window };
 // Which API does the reading. Auto is the only value most callers should use;
 // the rest exist so a user hitting a driver bug can pin a working one and so the
 // self-test can exercise each in isolation.
+#if defined(_WIN32)
 enum class CaptureBackend { Auto, Dxgi, Wgc, BitBlt };
+#else
+enum class CaptureBackend { Auto, Sck, Stream, CgImage };
+#endif
 
 struct CaptureConfig {
     CaptureTarget  target       = CaptureTarget::Monitor;
     CaptureBackend backend      = CaptureBackend::Auto;
     int            monitorIndex = 0;
-    void*          windowHandle = nullptr;   // HWND, when target == Window
+    void*          windowHandle = nullptr;   // HWND / CGWindowID, when target == Window
     bool           captureCursor = false;
     // CAPTUREBLT pulls layered/transparent windows into a GDI blit. BitBlt only;
     // the other two backends read the composed desktop and get them regardless.
@@ -119,6 +137,16 @@ public:
 
 const char* backendName(CaptureBackend backend);
 bool        parseBackendName(std::string_view name, CaptureBackend& out);
+// "auto, dxgi, wgc, bitblt" or this platform's equivalent, for error messages.
+const char* backendChoices();
+
+#if defined(__APPLE__)
+// Whether this process may read the screen (the Screen Recording permission,
+// which macOS grants to the terminal app it runs in). With `prompt`, asks
+// macOS to show its permission dialog / add the terminal to the list when the
+// answer is no; the grant only takes effect after the terminal restarts.
+bool screenCapturePermitted(bool prompt);
+#endif
 
 // Shared by every backend: the blit is always 1:1 and --max-width only decides
 // what the NV12 conversion pass downscales to, so the arithmetic belongs in one
@@ -132,7 +160,7 @@ struct MonitorInfo {
     int         x = 0, y = 0, width = 0, height = 0;
     bool        primary = false;
     std::string name;
-    void*       handle = nullptr;   // HMONITOR, for Windows.Graphics.Capture
+    void*       handle = nullptr;   // HMONITOR (Windows) / CGDirectDisplayID (macOS)
 };
 
 struct WindowInfo {

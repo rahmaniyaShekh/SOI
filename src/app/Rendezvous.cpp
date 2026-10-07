@@ -1,19 +1,19 @@
 #include "app/Rendezvous.h"
+#include "util/Crypto.h"
 #include "util/Log.h"
-#include "util/Win.h"
 
-#include <windows.h>
-#include <winhttp.h>
-#include <bcrypt.h>
+#if defined(_WIN32)
+  #include "util/Win.h"
+  #include <windows.h>
+  #include <winhttp.h>
+#else
+  #include "util/HttpCurl.h"
+#endif
 
 #include <atomic>
 #include <chrono>
 #include <thread>
 #include <vector>
-
-#ifndef NT_SUCCESS
-#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
-#endif
 
 namespace soi {
 namespace {
@@ -23,6 +23,14 @@ constexpr char kAlphabet[] = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 constexpr size_t kAlphabetSize = sizeof(kAlphabet) - 1;   // 31
 constexpr size_t kCodeLength   = 6;
 
+struct HttpResponse {
+    bool        transportOk = false;
+    int         status = 0;
+    std::string body;
+    std::string error;
+};
+
+#if defined(_WIN32)
 // WinHTTP handle wrapper: these leak silently and the failure mode is a hung
 // process rather than an obvious error.
 class HInternet {
@@ -75,13 +83,6 @@ ParsedUrl parseUrl(const std::string& url, const std::string& extraPath) {
     out.valid = true;
     return out;
 }
-
-struct HttpResponse {
-    bool        transportOk = false;
-    int         status = 0;
-    std::string body;
-    std::string error;
-};
 
 // Two long-lived sessions, and which one goes first.
 //
@@ -212,6 +213,42 @@ HttpResponse httpRequest(const std::string& baseUrl, const std::string& path,
     return second;
 }
 
+#else
+// One request/response through libcurl. Deliberately synchronous: this runs
+// during setup, not in the frame path. Proxy handling (environment, then the
+// System Settings proxy) lives in util/HttpCurl.cpp.
+HttpResponse httpRequest(const std::string& baseUrl, const std::string& path,
+                         const char* method, const std::string& body,
+                         int timeoutMs) {
+    HttpResponse out;
+    if (baseUrl.rfind("https://", 0) != 0 && baseUrl.rfind("http://", 0) != 0) {
+        out.error = "malformed rendezvous URL: " + baseUrl;
+        return out;
+    }
+    std::string base = baseUrl;
+    // Matches the WinHTTP path: a trailing slash on the base is not doubled.
+    const size_t schemeEnd = base.find("://") + 3;
+    while (base.size() > schemeEnd && base.back() == '/') base.pop_back();
+
+    CurlRequest req;
+    req.url              = base + path;
+    req.method           = method;
+    req.body             = body;
+    req.connectTimeoutMs = 5000;
+    req.totalTimeoutMs   = timeoutMs + 5000;
+    req.userAgent        = "soi-share/1.0";
+    if (!body.empty()) req.headers.push_back("Content-Type: application/json");
+
+    const CurlResponse r = curlPerform(req);
+    out.transportOk = r.transportOk;
+    out.status      = r.status;
+    out.body        = r.body;
+    out.error       = r.error;
+    return out;
+}
+
+#endif
+
 // Pulls one string field out of a small, known-shape JSON response. A full
 // parser is not worth a dependency for two fields.
 std::string jsonString(const std::string& json, const std::string& key) {
@@ -246,9 +283,8 @@ std::string jsonEscape(const std::string& s) {
 
 std::string generateShareCode() {
     uint8_t raw[kCodeLength] = {};
-    if (!NT_SUCCESS(BCryptGenRandom(nullptr, raw, sizeof raw,
-                                    BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
-        logE("BCryptGenRandom failed; refusing to emit a predictable share code");
+    if (!randomBytes(raw, sizeof raw)) {
+        logE("the system random generator failed; refusing to emit a predictable share code");
         return {};
     }
 
@@ -264,9 +300,7 @@ std::string generateShareCode() {
         unsigned value = raw[i];
         while (value >= kLimit) {
             uint8_t again = 0;
-            if (!NT_SUCCESS(BCryptGenRandom(nullptr, &again, 1,
-                                            BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
-                return {};
+            if (!randomBytes(&again, 1)) return {};
             value = again;
         }
         code.push_back(kAlphabet[value % kAlphabetSize]);
@@ -280,39 +314,13 @@ std::string formatShareCode(const std::string& code) {
 }
 
 std::string roomIdForCode(const std::string& code) {
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0)))
-        return {};
-
     uint8_t digest[32] = {};
-    const NTSTATUS st = BCryptHash(alg,
-                                   nullptr, 0,
-                                   reinterpret_cast<PUCHAR>(const_cast<char*>(code.data())),
-                                   static_cast<ULONG>(code.size()),
-                                   digest, sizeof digest);
-    BCryptCloseAlgorithmProvider(alg, 0);
-    if (!NT_SUCCESS(st)) return {};
-
-    static const char* kHex = "0123456789abcdef";
-    std::string out;
-    out.reserve(64);
-    for (uint8_t b : digest) {
-        out.push_back(kHex[b >> 4]);
-        out.push_back(kHex[b & 0x0F]);
-    }
-    return out;
+    if (!sha256(code.data(), code.size(), digest)) return {};
+    return toHex(digest, sizeof digest);
 }
 
 std::string generateSessionId() {
-    uint8_t raw[8] = {};
-    if (!NT_SUCCESS(BCryptGenRandom(nullptr, raw, sizeof raw,
-                                    BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
-        return {};
-    static const char* kHex = "0123456789abcdef";
-    std::string out;
-    out.reserve(16);
-    for (uint8_t b : raw) { out.push_back(kHex[b >> 4]); out.push_back(kHex[b & 0x0F]); }
-    return out;
+    return randomHex(8);
 }
 
 RendezvousResult publishOffer(const std::string& baseUrl, const std::string& roomId,

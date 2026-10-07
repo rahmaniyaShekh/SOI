@@ -1,10 +1,14 @@
 #include "app/LocalHandover.h"
 #include "util/Log.h"
-#include "util/Win.h"
+#include "util/Socket.h"
 
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <iphlpapi.h>
+#if defined(_WIN32)
+  #include "util/Win.h"
+  #include <iphlpapi.h>
+#else
+  #include <ifaddrs.h>
+  #include <net/if.h>
+#endif
 
 #include <algorithm>
 #include <cstring>
@@ -14,18 +18,7 @@ namespace {
 
 constexpr size_t kMaxRequest = 256 * 1024;   // an answer blob is ~1 KB
 
-// Winsock needs process-wide init. The daemon also uses sockets via
-// libdatachannel, so reference-count rather than assuming ownership.
-struct WinsockInit {
-    WinsockInit() {
-        WSADATA data{};
-        ok = WSAStartup(MAKEWORD(2, 2), &data) == 0;
-    }
-    ~WinsockInit() { if (ok) WSACleanup(); }
-    bool ok = false;
-};
-
-void ensureWinsock() { static WinsockInit init; }
+void ensureWinsock() { socketsReady(); }
 
 std::string httpResponse(const char* status, const char* contentType,
                          const std::string& body) {
@@ -78,6 +71,34 @@ std::vector<std::string> localAddresses() {
     ensureWinsock();
     std::vector<std::string> out;
 
+#if !defined(_WIN32)
+    // Prefer the real Wi-Fi/Ethernet interfaces (en0, en1, ...) over virtual
+    // ones -- VPN tunnels (utun), bridges for VMs (bridge, vmnet), AirDrop
+    // (awdl) -- which are almost never the address the friend can reach.
+    ifaddrs* list = nullptr;
+    if (getifaddrs(&list) != 0) return out;
+    std::vector<std::string> preferred, other;
+    for (ifaddrs* a = list; a; a = a->ifa_next) {
+        if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET) continue;
+        if (!(a->ifa_flags & IFF_UP) || !(a->ifa_flags & IFF_RUNNING)) continue;
+        if (a->ifa_flags & IFF_LOOPBACK) continue;
+
+        auto* sin = reinterpret_cast<sockaddr_in*>(a->ifa_addr);
+        char text[INET_ADDRSTRLEN] = {};
+        if (!inet_ntop(AF_INET, &sin->sin_addr, text, sizeof text)) continue;
+        if (std::strncmp(text, "169.254.", 8) == 0) continue;   // link-local
+
+        const bool physical = a->ifa_name && (std::strncmp(a->ifa_name, "en", 2) == 0 ||
+                                              std::strncmp(a->ifa_name, "eth", 3) == 0 ||
+                                              std::strncmp(a->ifa_name, "wl", 2) == 0);
+        (physical ? preferred : other).emplace_back(text);
+    }
+    freeifaddrs(list);
+    out = std::move(preferred);
+    out.insert(out.end(), other.begin(), other.end());
+    return out;
+#else
+
     ULONG size = 16 * 1024;
     std::vector<uint8_t> buffer(size);
     auto* addresses = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
@@ -122,6 +143,7 @@ std::vector<std::string> localAddresses() {
     out = std::move(preferred);
     out.insert(out.end(), other.begin(), other.end());
     return out;
+#endif
 }
 
 LocalHandover::~LocalHandover() { stop(); }
@@ -135,35 +157,41 @@ bool LocalHandover::start(int port, const std::string& viewerHtml,
 
     SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listener == INVALID_SOCKET) {
-        logE("handover: socket() failed ({})", WSAGetLastError());
+        logE("handover: socket() failed ({})", lastSocketError());
         return false;
     }
 
+    // Windows' SO_REUSEADDR lets a second process steal a bound port, so it is
+    // only the POSIX meaning -- rebind past TIME_WAIT -- that is wanted here.
+#if defined(_WIN32)
     BOOL reuse = TRUE;
+#else
+    int reuse = 1;
+#endif
     setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
                reinterpret_cast<const char*>(&reuse), sizeof reuse);
 
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(static_cast<u_short>(port));
+    addr.sin_port        = htons(static_cast<uint16_t>(port));
 
     if (bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == SOCKET_ERROR) {
         logE("handover: cannot bind port {} ({}). Another instance, or a "
-             "firewall policy, may be holding it.", port, WSAGetLastError());
+             "firewall policy, may be holding it.", port, lastSocketError());
         closesocket(listener);
         return false;
     }
 
     // Port 0 means "any free port"; read back what we actually got.
-    int addrLen = sizeof addr;
+    SockLen addrLen = sizeof addr;
     if (getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &addrLen) == 0)
         port_ = ntohs(addr.sin_port);
     else
         port_ = port;
 
     if (listen(listener, 8) == SOCKET_ERROR) {
-        logE("handover: listen() failed ({})", WSAGetLastError());
+        logE("handover: listen() failed ({})", lastSocketError());
         closesocket(listener);
         return false;
     }
@@ -179,12 +207,14 @@ bool LocalHandover::start(int port, const std::string& viewerHtml,
 void LocalHandover::stop() {
     if (!running_.exchange(false)) return;
 
-    // Closing the listening socket is what unblocks accept().
+    // The serving thread polls running_, so it is joined BEFORE the socket is
+    // closed: closing a descriptor another thread is still waiting on lets the
+    // number be reused underneath it.
+    if (thread_.joinable()) thread_.join();
     if (listenSocket_ != ~uintptr_t(0)) {
         closesocket(static_cast<SOCKET>(listenSocket_));
         listenSocket_ = ~uintptr_t(0);
     }
-    if (thread_.joinable()) thread_.join();
 }
 
 std::vector<std::string> LocalHandover::urls() const {
@@ -196,12 +226,22 @@ std::vector<std::string> LocalHandover::urls() const {
 
 void LocalHandover::serve() {
     while (running_.load()) {
+        // Polled rather than blocked in accept(), so stop() is seen promptly
+        // on every platform -- see util/Socket.h.
+        const int ready = waitReadable(static_cast<SOCKET>(listenSocket_), 200);
+        if (!running_.load()) break;
+        if (ready == 0) continue;
+        if (ready < 0) {
+            logT("handover: listener failed ({})", lastSocketError());
+            break;
+        }
+
         sockaddr_in peer{};
-        int peerLen = sizeof peer;
+        SockLen peerLen = sizeof peer;
         SOCKET client = accept(static_cast<SOCKET>(listenSocket_),
                                reinterpret_cast<sockaddr*>(&peer), &peerLen);
         if (client == INVALID_SOCKET) {
-            if (running_.load()) logT("handover: accept failed ({})", WSAGetLastError());
+            if (running_.load()) logT("handover: accept failed ({})", lastSocketError());
             break;
         }
 
@@ -218,9 +258,7 @@ void LocalHandover::handleClient(uintptr_t clientSocket) {
 
     // Requests here are tiny and trusted-ish (LAN), so a short receive timeout is
     // enough protection against a client that connects and says nothing.
-    DWORD timeout = 5000;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
-               reinterpret_cast<const char*>(&timeout), sizeof timeout);
+    setSocketTimeouts(s, 5000);
 
     std::string request;
     char buffer[4096];

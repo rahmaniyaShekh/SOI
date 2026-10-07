@@ -11,11 +11,8 @@
 #include "app/Control.h"
 #include "app/Install.h"
 #include "app/Update.h"
-#include "capture/BitBltCapture.h"
 #include "capture/CaptureFactory.h"
 #include "capture/CaptureProtect.h"
-#include "capture/DxgiCapture.h"
-#include "capture/WgcCapture.h"
 #include "encode/ColorConvert.h"
 #include "encode/H264Encoder.h"
 #include "encode/Quality.h"
@@ -23,6 +20,12 @@
 #include "util/Json.h"
 #include "util/Log.h"
 #include "util/Parallel.h"
+#include "util/Platform.h"
+
+#if defined(_WIN32)
+#include "capture/BitBltCapture.h"
+#include "capture/DxgiCapture.h"
+#include "capture/WgcCapture.h"
 #include "util/Win.h"
 
 #include <windows.h>
@@ -32,6 +35,12 @@
 #include <io.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#else
+#include "capture/mac/MacCapture.h"
+#include "gpu/GpuPipeline.h"
+#include "selftest_mac.h"
+#include <unistd.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -213,7 +222,7 @@ void testColorConvert() {
     section("BGRA -> NV12 (BT.709 limited)");
 
     info(soi::format("{} path, {} worker(s)",
-                     colorConvertUsesSimd() ? "SSSE3" : "scalar", sharedPool().size()));
+                     colorConvertSimdName(), sharedPool().size()));
 
     struct Probe { const char* name; uint8_t b, g, r; double y, u, v; };
     // Reference values from the BT.709 studio-swing matrix, computed independently
@@ -655,6 +664,7 @@ void testQuality() {
     }
 }
 
+#if defined(_WIN32)
 // ---------------------------------------------------------------------------
 // Capture
 // ---------------------------------------------------------------------------
@@ -1951,9 +1961,14 @@ void testGpuPipeline() {
           "the bitstream carries real content, not a flat frame",
           soi::format("{} bytes over {} frames", bytes, frames));
 }
+#endif // _WIN32
 
 void testEncoder() {
+#if defined(_WIN32)
     section("Media Foundation H.264 encoder");
+#else
+    section("VideoToolbox H.264 encoder");
+#endif
 
     EncoderConfig cfg;
     cfg.width = 1280; cfg.height = 720; cfg.fps = 30;
@@ -1971,6 +1986,9 @@ void testEncoder() {
     // every NAL after the first is split wrong and the peer decodes nothing.
     int startCode3 = 0, startCode4 = 0;
 
+    // Everything the encoder emitted, so it can be decoded again below.
+    std::vector<std::vector<uint8_t>> accessUnits;
+
     H264Encoder encoder;
     const bool started = encoder.start(cfg,
         [&](const uint8_t* nal, size_t len, bool key, int64_t /*pts*/) {
@@ -1978,6 +1996,7 @@ void testEncoder() {
             ++frames;
             totalBytes += len;
             if (key) ++keyframes;
+            accessUnits.emplace_back(nal, nal + len);
 
             for (size_t i = 0; i + 3 < len; ++i) {
                 if (nal[i] == 0 && nal[i + 1] == 0) {
@@ -2106,6 +2125,32 @@ void testEncoder() {
 
     encoder.stop();
 
+#if !defined(_WIN32)
+    // Decoding what was encoded is the strongest check there is short of a
+    // browser: it proves the Annex-B framing, the SPS/PPS and every slice.
+    {
+        std::vector<std::vector<uint8_t>> units;
+        {
+            std::lock_guard lk(mtx);
+            units = accessUnits;
+        }
+        int decoded = 0, width = 0, height = 0;
+        std::string detail;
+        const bool ok = macDecodeAnnexB(units, decoded, width, height, detail);
+        check(ok && decoded >= static_cast<int>(units.size()) * 9 / 10,
+              "VideoToolbox decodes the stream back (Annex-B, SPS/PPS, slices all valid)",
+              soi::format("{} of {} decoded{}{}", decoded, units.size(),
+                          detail.empty() ? "" : ": ", detail));
+        check(width == cfg.width && height == cfg.height, "decoded frames have the encoded size",
+              soi::format("{}x{}", width, height));
+        int profileIdc = 0;
+        for (const auto& u : units)
+            if (macFindSpsProfile(u, profileIdc)) break;
+        check(profileIdc == 77, "the SPS says Main profile, as the SDP advertises (4d00xx)",
+              soi::format("profile_idc {}", profileIdc));
+    }
+#endif
+
     // --- the drop policy itself, asserted rather than tripped over ------------
     // A burst must be discarded, not queued: a stale screen frame has no value
     // and buffering it would add latency the viewer can never recover.
@@ -2140,6 +2185,7 @@ void testEncoder() {
 // ---------------------------------------------------------------------------
 // install / update / control -- the pure logic behind the self-managing exe
 // ---------------------------------------------------------------------------
+#if defined(_WIN32)
 void testPathList() {
     section("user PATH editing");
     const std::string dir = R"(C:\Users\me\AppData\Local\Programs\soi-share)";
@@ -2217,6 +2263,83 @@ void testInstallDir() {
     check(!samePath("C:\\Windows", "C:\\Windows2"), "different folders differ");
 }
 
+#else
+void testPathList() {
+    section("user PATH editing (shell profiles)");
+    const std::string dir = installDirFor(localAppDataDir());
+    bool changed = false;
+    int removed = 0;
+
+    // ':'-separated PATH, used to tell whether this shell already has the dir.
+    check(pathListAdd("", dir, changed) == dir && changed, "adds to an empty PATH");
+    check(pathListAdd("/usr/bin:/bin", dir, changed) == "/usr/bin:/bin:" + dir && changed,
+          "appends, never prepends");
+    pathListAdd("/usr/bin:" + dir + "/", dir, changed);
+    check(!changed, "a trailing slash is the same folder");
+    pathListAdd("/usr/bin:~/.soi-share/bin", dir, changed);
+    check(!changed, "~/ is expanded before comparing");
+    pathListAdd("/usr/bin:$HOME/.soi-share/bin", dir, changed);
+    check(!changed, "$HOME is expanded before comparing");
+    check(pathListRemove("/a:" + dir + ":/b", dir, removed) == "/a:/b" && removed == 1,
+          "remove drops the entry and keeps the rest");
+    check(pathListRemove(dir + "2:/x", dir, removed) == dir + "2:/x" && removed == 0,
+          "remove leaves look-alike folders alone");
+
+    // The block written into ~/.zshrc and friends.
+    const std::string original = "export EDITOR=vim\nalias ll='ls -l'\n";
+    std::string withBlock = profileAddPathBlock(original, dir, false, changed);
+    check(changed && withBlock.find("export PATH=\"$PATH:$HOME/.soi-share/bin\"") != std::string::npos,
+          "adds an export line, spelled with $HOME", withBlock);
+    check(withBlock.rfind(original, 0) == 0, "everything the user wrote is kept, in place");
+    std::string twice = profileAddPathBlock(withBlock, dir, false, changed);
+    check(!changed && twice == withBlock, "adding twice changes nothing (one block only)");
+    check(profileRemovePathBlock(withBlock, removed) == original && removed == 1,
+          "remove gives back the exact original file", profileRemovePathBlock(withBlock, removed));
+    check(profileRemovePathBlock(original, removed) == original && removed == 0,
+          "removing from a file without the block changes nothing");
+    const std::string noNewline = "export A=1";
+    check(profileRemovePathBlock(profileAddPathBlock(noNewline, dir, false, changed), removed) ==
+              noNewline + "\n",
+          "a file without a final newline gets one, and nothing else");
+    const std::string fish = profileAddPathBlock("", dir, true, changed);
+    check(fish.find("set -gx PATH $PATH") != std::string::npos, "fish syntax for fish", fish);
+    const std::string mentioned = "# >>> soi-share >>> mentioned mid-line is not a block\n";
+    check(profileRemovePathBlock("echo x " + mentioned, removed) == "echo x " + mentioned &&
+              removed == 0,
+          "a marker that does not start a line is left alone");
+}
+
+void testInstallDir() {
+    section("install location");
+    check(installDirFor("/Users/me") == "/Users/me/.soi-share/bin", "~/.soi-share/bin");
+    check(installDirFor("/Users/me/") == "/Users/me/.soi-share/bin",
+          "a trailing slash on HOME is tolerated");
+    check(!localAppDataDir().empty(), "HOME resolves", localAppDataDir());
+    check(installedExePath() == installDir() + "/soi-share", "installed binary path");
+    check(samePath("/usr/bin/", "/usr/bin"), "trailing slashes do not matter");
+    check(samePath("/usr/bin/../bin", "/usr/bin"), "'..' is resolved before comparing");
+    check(!samePath("/usr/bin", "/usr/sbin"), "different folders differ");
+    char tmp[] = "/tmp/soi-selftest-XXXXXX";
+    if (mkdtemp(tmp)) {
+        const std::string real = std::string(tmp) + "/real";
+        const std::string link = std::string(tmp) + "/link";
+        writeFileBytes(real, "x");
+        symlink(real.c_str(), link.c_str());
+        check(samePath(real, link), "a symlink and its target are the same path");
+        std::string error;
+        const std::string target = std::string(tmp) + "/target";
+        writeFileBytes(target, "old");
+        check(replaceExecutable(target, real, error), "replaces a binary in place", error);
+        std::string got;
+        readFileBytes(target, got);
+        check(got == "x", "the new contents are in place");
+        check(removeDirectoryTree(tmp), "removes a folder tree (without following the link)");
+        check(fileExists(real) == false, "and everything in it is gone");
+    }
+}
+
+#endif
+
 void testChecksums() {
     section("SHA256SUMS.txt");
     check(sha256Hex("abc", 3) ==
@@ -2260,6 +2383,7 @@ void testVersions() {
           "compares numerically (1.9.9 < 1.10.0)");
 }
 
+#if defined(_WIN32)
 void testTokens() {
     section("saved GitHub token (DPAPI)");
     const std::string token = "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz";
@@ -2288,6 +2412,32 @@ void testTokens() {
     check(classifyToken("gho_abc") == TokenKind::OAuth, "gho_ (GitHub CLI) is OAuth");
     check(classifyToken(std::string(40, 'f')) == TokenKind::Classic, "40 hex chars is a legacy classic token");
 }
+
+#else
+void testTokens() {
+    section("saved GitHub token (login Keychain)");
+    const std::string token = "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz";
+    const std::string account = "selftest-" + std::to_string(currentProcessId());
+    if (!keychainStore(account, token)) {
+        // A CI runner or an ssh session may have no unlocked login keychain;
+        // that is the environment, not the code.
+        std::printf("  \x1b[33mSKIP\x1b[0m  no usable login keychain in this session\n");
+    } else {
+        std::string back;
+        check(keychainLoad(account, back) && back == token, "stores and reads back the token");
+        check(keychainStore(account, token + "2") && keychainLoad(account, back) &&
+                  back == token + "2",
+              "storing again replaces it");
+        check(keychainDelete(account), "deletes it");
+        check(!keychainLoad(account, back), "and it is gone");
+    }
+    check(classifyToken(token) == TokenKind::FineGrained, "github_pat_ is fine-grained");
+    check(classifyToken("ghp_abc") == TokenKind::Classic, "ghp_ is classic");
+    check(classifyToken("gho_abc") == TokenKind::OAuth, "gho_ (GitHub CLI) is OAuth");
+    check(classifyToken(std::string(40, 'f')) == TokenKind::Classic, "40 hex chars is a legacy classic token");
+}
+
+#endif
 
 void testJson() {
     section("JSON reader (release metadata)");
@@ -2343,14 +2493,16 @@ void testControlFormat() {
           "parses an instance record");
     check(!parseInstanceRecord("pid=1234\nport=0\nsecret=abcd\n", rec), "a record with no port is invalid");
     check(!parseInstanceRecord("pid=1234\nport=5000\n", rec), "a record with no secret is invalid");
-    check(!processAlive(0) && processAlive(GetCurrentProcessId()), "process liveness");
-    check(!processAlive(GetCurrentProcessId(), "C:\\not\\this.exe"),
+    check(!processAlive(0) && processAlive(currentProcessId()), "process liveness");
+    check(!processAlive(currentProcessId(), "C:\\not\\this.exe"),
           "a live pid with a different image is not ours (pid reuse)");
 }
 
 void writeRaw(const std::string& text) {
     std::fflush(stdout);
+#if defined(_WIN32)
     _setmode(_fileno(stdout), _O_BINARY);
+#endif
     std::fwrite(text.data(), 1, text.size(), stdout);
     std::fflush(stdout);
 }
@@ -2365,6 +2517,7 @@ int runBlobEncode(int argc, char** argv) {
     return 0;
 }
 
+#if defined(_WIN32)
 // Isolates where GDI capture time actually goes, below the BitBltCapture class:
 // raw blit vs CAPTUREBLT vs each StretchBlt quality mode vs a two-step
 // blit-then-scale. Run with: soi-selftest capture-bench
@@ -2458,6 +2611,7 @@ int runCaptureBench() {
     ReleaseDC(nullptr, screen);
     return 0;
 }
+#endif
 
 int runBlobDecode(int argc, char** argv) {
     if (argc < 3) { std::fprintf(stderr, "usage: blob-decode <blob> [pass]\n"); return 2; }
@@ -2472,9 +2626,108 @@ int runBlobDecode(int argc, char** argv) {
     return 0;
 }
 
+#if !defined(_WIN32)
+// ---------------------------------------------------------------------------
+// macOS: capture and the zero-copy encode path
+// ---------------------------------------------------------------------------
+void testMacDisplays() {
+    section("displays and windows");
+    const auto mons = enumerateMonitors();
+    check(!mons.empty(), "at least one display", soi::format("{}", mons.size()));
+    for (const auto& m : mons)
+        info(soi::format("{}: {} {}x{} at {},{}{}", m.index, m.name, m.width, m.height, m.x, m.y,
+                         m.primary ? " (main)" : ""));
+    if (!mons.empty())
+        check(mons[0].primary, "display 0 is the main display");
+    info(soi::format("{} capturable window(s)", enumerateWindows().size()));
+    info(soi::format("Screen Recording permission: {}",
+                     screenCapturePermitted(false) ? "granted" : "NOT granted"));
+}
+
+void testMacCapture() {
+    section("capture backends (ScreenCaptureKit, CGDisplayStream, CGImage)");
+    if (!screenCapturePermitted(false)) {
+        std::printf("  \x1b[33mSKIP\x1b[0m  no Screen Recording permission for this terminal\n");
+        return;
+    }
+    CaptureConfig cfg;
+    cfg.target = CaptureTarget::Monitor;
+    int working = 0;
+    for (const auto& r : probeBackends(cfg)) {
+        info(soi::format("{:<8} {}", backendName(r.backend), r.detail));
+        if (r.started && r.gotFrame) ++working;
+    }
+    check(working > 0, "at least one backend reads the main display");
+
+    cfg.target = CaptureTarget::VirtualDesktop;
+    auto desk = createFrameSource(cfg);
+    const bool deskOk = desk->start() && desk->capture() != nullptr;
+    check(deskOk, "every display at once (--desktop) produces a frame", desk->describe());
+    desk->stop();
+
+    // The automatic source, as `start` uses it, with the GPU path on.
+    cfg.target    = CaptureTarget::Monitor;
+    cfg.preferGpu = true;
+    auto src = createFrameSource(cfg);
+    if (src->start()) {
+        const Frame* f = nullptr;
+        for (int i = 0; i < 20 && !f; ++i) f = src->capture();
+        check(f != nullptr, "the automatic source delivers frames", src->describe());
+        info(soi::format("backend {}, frames {} the GPU", backendName(src->backend()),
+                         src->gpuDevice() ? "stay on" : "are copied off"));
+        src->stop();
+    } else {
+        check(false, "the automatic source starts");
+    }
+}
+
+void testMacGpuEncode() {
+    section("zero-copy encode (IOSurface -> GPU NV12 -> VideoToolbox)");
+    auto device = sharedGpuDevice();
+    H264Encoder encoder;
+    check(encoder.enableGpuInput(device), "the encoder accepts GPU frames", device->describe());
+
+    EncoderConfig cfg;
+    cfg.width = 1280; cfg.height = 720; cfg.fps = 30; cfg.bitrateKbps = 3000; cfg.gopSeconds = 2;
+    std::mutex mtx;
+    std::vector<std::vector<uint8_t>> units;
+    const bool started = encoder.start(cfg, [&](const uint8_t* nal, size_t len, bool, int64_t) {
+        std::lock_guard lk(mtx);
+        units.emplace_back(nal, nal + len);
+    });
+    check(started && encoder.usesGpuInput(), "starts with GPU input");
+    if (!started) return;
+
+    // 1920x1080 BGRA in, 1280x720 NV12 out: the scale happens on the GPU too.
+    int fed = 0;
+    for (int n = 0; n < 30; ++n) {
+        void* frame = macMakeTestPixelBuffer(1920, 1080, n);
+        if (!frame) break;
+        if (encoder.submitTexture(frame, static_cast<int64_t>(n) * 33'333'333LL)) ++fed;
+        macReleasePixelBuffer(frame);
+        std::this_thread::sleep_for(33ms);
+    }
+    std::this_thread::sleep_for(500ms);
+    encoder.stop();
+
+    std::vector<std::vector<uint8_t>> got;
+    {
+        std::lock_guard lk(mtx);
+        got = units;
+    }
+    check(fed >= 25 && got.size() >= 25, "IOSurface frames are encoded",
+          soi::format("{} fed, {} encoded", fed, got.size()));
+    int decoded = 0, w = 0, h = 0;
+    std::string detail;
+    check(macDecodeAnnexB(got, decoded, w, h, detail) && decoded > 0 && w == 1280 && h == 720,
+          "and decode back at the encode size", soi::format("{} decoded, {}x{} {}", decoded, w, h, detail));
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
+#if defined(_WIN32)
     SetConsoleOutputCP(CP_UTF8);
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD  mode = 0;
@@ -2483,16 +2736,25 @@ int main(int argc, char** argv) {
 
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION, MFSTARTUP_LITE);
+#endif
 
     int rc = 0;
     if (argc > 1 && std::strcmp(argv[1], "blob-encode") == 0) {
         rc = runBlobEncode(argc, argv);
     } else if (argc > 1 && std::strcmp(argv[1], "blob-decode") == 0) {
         rc = runBlobDecode(argc, argv);
+#if defined(_WIN32)
     } else if (argc > 1 && std::strcmp(argv[1], "capture-bench") == 0) {
         rc = runCaptureBench();
+#endif
     } else if (argc > 1 && std::strcmp(argv[1], "unit") == 0) {
+#if defined(_WIN32)
         std::printf("\x1b[1msoi-selftest unit\x1b[0m (no screen, GPU or media stack needed)\n");
+#else
+        // VideoToolbox is part of every macOS install, so the encoder -- the
+        // piece most likely to differ between Macs -- is part of the unit run.
+        std::printf("\x1b[1msoi-selftest unit\x1b[0m (no screen needed)\n");
+#endif
         g_timingIsAdvisory = true;
         testBase64();
         testSignalBlob();
@@ -2507,6 +2769,10 @@ int main(int argc, char** argv) {
         testTokens();
         testJson();
         testControlFormat();
+#if !defined(_WIN32)
+        testEncoder();
+        testMacGpuEncode();
+#endif
 
         std::printf("\n\x1b[1m== summary ==\x1b[0m\n");
         std::printf("  \x1b[32m%d passed\x1b[0m", g_pass);
@@ -2514,7 +2780,9 @@ int main(int argc, char** argv) {
         std::printf("\n\n");
         rc = g_fail ? 1 : 0;
     } else {
+#if defined(_WIN32)
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+#endif
 
         std::printf("\x1b[1msoi-selftest\x1b[0m\n");
 
@@ -2524,6 +2792,7 @@ int main(int argc, char** argv) {
         testThreadPool();
         testLevels();
         testQuality();
+#if defined(_WIN32)
         testCapture();
         testCaptureBackends();
         testOverlayCapture();
@@ -2533,6 +2802,12 @@ int main(int argc, char** argv) {
         testEncoder();
         testGpuConvert();
         testGpuPipeline();
+#else
+        testMacDisplays();
+        testMacCapture();
+        testEncoder();
+        testMacGpuEncode();
+#endif
         testPathList();
         testInstallDir();
         testChecksums();
@@ -2548,7 +2823,9 @@ int main(int argc, char** argv) {
         rc = g_fail ? 1 : 0;
     }
 
+#if defined(_WIN32)
     MFShutdown();
     CoUninitialize();
+#endif
     return rc;
 }

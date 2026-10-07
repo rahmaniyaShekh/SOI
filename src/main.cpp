@@ -22,7 +22,6 @@
 #include "capture/CaptureFactory.h"
 #include "capture/CaptureProtect.h"
 #include "encode/ColorConvert.h"
-#include "capture/DxgiCapture.h"
 #include "encode/H264Encoder.h"
 #include "encode/Quality.h"
 #include "gpu/GpuPipeline.h"
@@ -30,15 +29,22 @@
 #include "net/Streamer.h"
 #include "util/Log.h"
 #include "util/Parallel.h"
-#include "util/Win.h"
+#include "util/Platform.h"
 
-#include <windows.h>
-#include <conio.h>
-#include <mfapi.h>
-#include <shellapi.h>
-// gpu-check builds a converter to prove the shader path really works, and its
-// ComPtr members need the complete D3D11 interfaces to destruct.
-#include <d3d11.h>
+#if defined(_WIN32)
+  #include "capture/DxgiCapture.h"
+  #include "util/Win.h"
+  #include <windows.h>
+  #include <conio.h>
+  #include <mfapi.h>
+  #include <shellapi.h>
+  // gpu-check builds a converter to prove the shader path really works, and its
+  // ComPtr members need the complete D3D11 interfaces to destruct.
+  #include <d3d11.h>
+#else
+  #include <csignal>
+  #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -57,9 +63,11 @@ using namespace std::chrono_literals;
 
 namespace {
 
+#if defined(_WIN32)
 // Present only in Windows 10 1803+ SDKs.
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 #endif
 
 std::atomic<bool> g_running{true};
@@ -70,12 +78,46 @@ bool g_attached = false;
 
 bool printJoinInfo(const std::map<std::string, std::string>& live);
 
+#if defined(_WIN32)
 BOOL WINAPI consoleHandler(DWORD type) {
     if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
         g_running.store(false);
         return TRUE;
     }
     return FALSE;
+}
+#else
+// Ctrl+C, `kill`, and the terminal window closing (SIGHUP) all mean the same as
+// a console close on Windows: stop cleanly, withdrawing the share code.
+// std::atomic<bool> is lock-free here, so the store is async-signal-safe.
+void signalHandler(int) { g_running.store(false); }
+#endif
+
+// How to type this program at the prompt. On macOS a binary that was simply
+// unzipped somewhere is not on PATH, so `soi-share status` would be "command
+// not found"; the hints say `./soi-share` there instead.
+std::string selfCommand() {
+#if defined(_WIN32)
+    return "soi-share";
+#else
+    static const std::string cmd = [] {
+        const std::string dir = directoryOf(currentExePath());
+        const std::string path = envVar("PATH");
+        size_t start = 0;
+        while (start <= path.size()) {
+            size_t end = path.find(':', start);
+            if (end == std::string::npos) end = path.size();
+            std::string entry = path.substr(start, end - start);
+            while (entry.size() > 1 && entry.back() == '/') entry.pop_back();
+            if (!entry.empty() && entry == dir) return std::string("soi-share");
+            start = end + 1;
+        }
+        char cwd[4096] = {};
+        if (getcwd(cwd, sizeof cwd) && dir == cwd) return std::string("./soi-share");
+        return currentExePath();
+    }();
+    return cmd;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +208,7 @@ struct Options {
     std::string logFile;
 };
 
+#if defined(_WIN32)
 void printUsage() {
     std::printf("soi-share %s -- serverless P2P screen sharing from the terminal\n", appVersion());
     std::puts(R"(
@@ -309,6 +352,153 @@ MISC
   --log-file <path>      (start) log here instead of
                          %LOCALAPPDATA%\soi-share\soi-share.log)");
 }
+#else
+void printUsage() {
+    std::printf("soi-share %s -- serverless P2P screen sharing from the terminal\n", appVersion());
+    if (selfCommand() != "soi-share")
+        std::printf("\nNot on your PATH: from this folder, type ./soi-share instead of soi-share\n"
+                    "(or run `./soi-share install` once to put it on your PATH).\n");
+    std::puts(R"(
+QUICK START
+  soi-share start          start sharing in the background; prints a 6-character
+                           code your friend types at https://share.mdarif.online
+  soi-share status         is it running? pid, uptime, the code, live stats
+  soi-share stop           stop sharing
+
+  The first start asks macOS for Screen Recording permission for your terminal
+  app: allow it in System Settings > Privacy & Security > Screen Recording, then
+  quit and reopen the terminal.
+
+SHARING
+  start [options]          start in the background and return to the prompt
+  start --foreground       stay attached with a live log instead (Ctrl+C stops)
+  status                   pid, uptime, state and code of the running share
+  stop [--force]           stop it; --force ends it if it will not stop
+  answer <blob>            hand a viewer's answer to the running share (--no-code)
+  offer                    reprint the pending offer blob (--no-code)
+  list-monitors            enumerate displays
+  list-windows             enumerate capturable windows
+
+INSTALL AND UPDATE (per-user; never needs admin; entirely optional)
+  install                  copy this binary to ~/.soi-share/bin and add that
+                           folder to your PATH (in ~/.zshrc, ~/.bash_profile)
+  update                   download the latest release, verify its SHA-256 and
+                           replace this binary; a running share restarts on it
+  update --check           only say whether a newer release exists
+  update --force           reinstall the latest release even if this is current
+  update --forget-token    delete the saved GitHub token
+  uninstall [--purge]      stop, remove from PATH, delete the program folder. Your
+                           share code is kept unless --purge
+  version                  version, and whether this is the installed copy
+  licenses                 third-party license notices
+  help                     this text
+
+DIAGNOSTICS
+  capture-check            try every capture backend and report what works
+  gpu-check                report whether frames can stay on the GPU, and why not
+  run [options]            foreground session that reads the answer from stdin
+  purge                    erase all on-disk state (log, share code, saved token)
+
+CAPTURE TARGET
+  --monitor <N>          share display N (default: 0, the main display)
+  --desktop              share every display at once, as one wide picture
+  --window <id|text>     share one window, by window id or title substring
+
+                         This only sets where the session STARTS. On a screen
+                         share the viewer is shown how many displays this Mac
+                         has and can switch between them -- or to all of them at
+                         once -- from their browser, without touching this Mac.
+                         `soi-share list-monitors` shows what they will see.
+
+                         A WINDOW share is never switchable: the operator chose
+                         one window, and no message from the far end can widen
+                         that to a screen. Use --lock-target to pin a screen
+                         share the same way.
+
+  --capture <backend>    auto | sck | stream | cgimage   (default: auto)
+                         Auto is what makes the share show everything on the
+                         screen: ScreenCaptureKit (macOS 12.3+) reads displays
+                         and windows from the compositor, GPU-resident and with
+                         the cursor drawn by the system; CGDisplayStream covers
+                         older macOS; CGImage capture is the floor. If the
+                         running backend stops producing frames the next one
+                         takes over mid-session.
+
+                         Naming one pins it and disables that fallback, which is
+                         for diagnosing a problem, not for sharing. Run
+                         `soi-share capture-check` first.
+
+PIPELINE
+  --gpu                  keep every frame on the graphics card: ScreenCaptureKit's
+                         IOSurface is scaled and converted to NV12 by the GPU and
+                         handed straight to the VideoToolbox encoder. No readback,
+                         no CPU conversion. Fails to start if this Mac cannot do
+                         it, rather than falling back.
+
+  --cpu                  always read frames back and convert on the CPU (NEON on
+                         Apple silicon, SSSE3 on Intel). Slower.
+
+  --pipeline <mode>      auto | gpu | cpu   (default: auto)
+                         Auto is --gpu where every precondition holds and --cpu
+                         otherwise. `soi-share gpu-check` says which you get and
+                         why.
+
+QUALITY
+  --quality <level>      360p | 480p | 720p | 1080p | source   (default 720p)
+                         The VIEWER can change this at any time from their
+                         browser; this only sets where the session starts.
+
+                         On a slow link the resolution is HELD and the frame
+                         rate drops instead, so text stays sharp and readable
+                         rather than being smeared to fit the bitrate.
+
+  --min-fps <N>          how far the frame rate may fall before per-frame
+                         quality has to give way too (default 2)
+  --fps <N>              hard cap on the frame rate, 1-30 (default 30)
+  --bitrate <kbps>       override the level's bitrate ceiling
+  --min-bitrate <kbps>   floor for congestion control (default 600)
+  --max-width <px>       cap the capture size before scaling (default 1920)
+  --gop <seconds>        keyframe interval (default 10)
+  --idle-refresh <sec>   force a frame when the screen is static (default 2)
+  --cursor               show the mouse pointer in the stream
+
+PRIVACY
+  --protect / --no-protect   exclude our own windows from capture (default on)
+  --lock-target              pin the share to the target named above. The viewer
+                             gets no screen picker and is not told what other
+                             displays exist. Implied by --window.
+  --pass <passphrase>        encrypt signalling blobs (AES-256-GCM)
+
+NETWORK
+  --stun <url>           STUN server; repeat to use several. Defaults to
+                         stun.cloudflare.com and stun.l.google.com (free, no
+                         signup). The first --stun replaces the defaults.
+  --no-stun              host candidates only -- same-LAN, zero external contact
+  --turn <url>           TURN relay (turn:host:3478 / turns:host:5349). Fallback
+                         only. The relay forwards DTLS-SRTP ciphertext and
+                         cannot see your screen.
+  --turn-user <name>     TURN username
+  --turn-pass <secret>   TURN credential
+
+LOW BANDWIDTH
+  --low                  preset for ~1 Mbps links: 480p, held sharp, with the
+                         frame rate free to fall as far as --min-fps.
+
+MISC
+  --new-code             rotate this Mac's share code (revokes the old one)
+  --no-reconnect         exit when the connection drops instead of re-offering
+                         the same code
+  --no-code              do not use the short-code service; print a long blob
+  --service <url>        rendezvous base URL (default https://share.mdarif.online)
+  --port <N>             port for the local handover page (default 8000)
+  --no-http              disable the handover page; use the send-a-file flow
+  --open-viewer          also open the viewer on THIS machine (off by default)
+  --verbose              trace logging
+  --foreground           (start) stay attached with a live log
+  --log-file <path>      (start) log here instead of
+                         ~/Library/Application Support/soi-share/soi-share.log)");
+}
+#endif
 
 bool parseInt(const char* text, int& out) {
     if (!text) return false;
@@ -406,8 +596,7 @@ bool parseOptions(int argc, char** argv, int first, Options& o) {
             const char* v = next("--capture");
             if (!v) return false;
             if (!parseBackendName(v, o.backend)) {
-                logE("unknown capture backend '{}'; choose one of: auto, dxgi, "
-                     "wgc, bitblt", v);
+                logE("unknown capture backend '{}'; choose one of: {}", v, backendChoices());
                 return false;
             }
         }
@@ -464,7 +653,7 @@ std::string joinQuoted(const std::vector<std::string>& args) {
     std::string out;
     for (const auto& a : args) {
         if (!out.empty()) out += ' ';
-        out += toUtf8(quoteArg(a));
+        out += quoteArgument(a);
     }
     return out;
 }
@@ -478,8 +667,23 @@ std::string joinQuoted(const std::vector<std::string>& args) {
 // it is that monitor; with several it is wider than any one of them, and it
 // includes the dead space between mismatched screens.
 void virtualDesktopSize(int& width, int& height) {
+#if defined(_WIN32)
     width  = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+#else
+    // The bounding box of every display in the global coordinate space.
+    int left = 0, top = 0, right = 0, bottom = 0;
+    bool first = true;
+    for (const auto& m : enumerateMonitors()) {
+        if (first || m.x < left) left = m.x;
+        if (first || m.y < top) top = m.y;
+        if (first || m.x + m.width > right) right = m.x + m.width;
+        if (first || m.y + m.height > bottom) bottom = m.y + m.height;
+        first = false;
+    }
+    width  = right - left;
+    height = bottom - top;
+#endif
 }
 
 void listMonitors() {
@@ -521,31 +725,39 @@ std::string jsonEscape(const std::string& in) {
 
 void listWindows() {
     const auto wins = enumerateWindows();
+#if defined(_WIN32)
     std::printf("\n%-18s %-12s %-24s %s\n", "HWND", "SIZE", "PROCESS", "TITLE");
+    const char* idFormat = "0x%-16llX %-12s %-24s %s\n";
+#else
+    std::printf("\n%-18s %-12s %-24s %s\n", "WINDOW ID", "SIZE", "APP", "TITLE");
+    const char* idFormat = "%-18llu %-12s %-24s %s\n";
+#endif
     for (const auto& w : wins) {
         std::string title = w.title;
         if (title.size() > 60) title = title.substr(0, 57) + "...";
-        std::printf("0x%-16llX %-12s %-24s %s\n",
-                    reinterpret_cast<unsigned long long>(w.handle),
+        std::printf(idFormat,
+                    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(w.handle)),
                     soi::format("{}x{}", w.width, w.height).c_str(),
                     w.process.c_str(), title.c_str());
     }
     std::printf("\n%zu window(s)\n", wins.size());
 }
 
-HWND resolveWindowSpec(const std::string& spec) {
+// A window handle (HWND) on Windows, a CGWindowID on macOS -- both carried in
+// a void* so the capture layer can stay agnostic.
+void* resolveWindowSpec(const std::string& spec) {
     if (spec.rfind("0x", 0) == 0 || spec.rfind("0X", 0) == 0) {
         const auto value = std::strtoull(spec.c_str() + 2, nullptr, 16);
-        if (value) return reinterpret_cast<HWND>(static_cast<uintptr_t>(value));
+        if (value) return reinterpret_cast<void*>(static_cast<uintptr_t>(value));
     }
     if (!spec.empty() && spec.find_first_not_of("0123456789") == std::string::npos) {
         const auto value = std::strtoull(spec.c_str(), nullptr, 10);
-        if (value) return reinterpret_cast<HWND>(static_cast<uintptr_t>(value));
+        if (value) return reinterpret_cast<void*>(static_cast<uintptr_t>(value));
     }
     for (const auto& w : enumerateWindows())
-        if (containsNoCase(w.title, spec)) {
+        if (containsNoCase(w.title, spec) || containsNoCase(w.process, spec)) {
             logI("matched window '{}' ({})", w.title, w.process);
-            return static_cast<HWND>(w.handle);
+            return w.handle;
         }
     logE("no visible window matches '{}'; try: soi-share list-windows", spec);
     return nullptr;
@@ -585,18 +797,33 @@ void captureCheck(const Options& opt) {
                     size.c_str(), ms.c_str(), r.detail.c_str());
     }
 
+#if defined(_WIN32)
     std::printf(
         "\nMS/GRAB on a still screen is mostly the cost of ASKING whether anything\n"
         "changed. dxgi and wgc are told by the compositor; bitblt has to re-read\n"
         "and hash the whole screen to find out, which is the 16 ms.\n");
+#else
+    std::printf(
+        "\nMS/GRAB on a still screen is mostly the cost of ASKING whether anything\n"
+        "changed. sck and stream are told by the compositor; cgimage has to copy\n"
+        "and hash the whole screen to find out.\n");
+#endif
     std::printf("\n%d of 3 backends can read this target.\n", working);
     if (working) {
         std::printf("Sharing picks a working one automatically; no flag needed.\n\n");
     } else {
+#if defined(_WIN32)
         std::printf(
             "\nNothing can read it. That normally means the target is protected with\n"
             "SetWindowDisplayAffinity, or is only visible on the secure desktop. No\n"
             "user-mode capture API on Windows can read either -- see README 1.2.\n\n");
+#else
+        std::printf(
+            "\nNothing can read it. Almost always that is the Screen Recording\n"
+            "permission: allow your terminal app in System Settings > Privacy &\n"
+            "Security > Screen Recording, then quit and reopen the terminal. A window\n"
+            "that marks itself as not shareable also reads as black.\n\n");
+#endif
     }
 }
 
@@ -606,6 +833,7 @@ void captureCheck(const Options& opt) {
 // driver version: the capture is started, the device is shared, the encoder is
 // asked whether it will take that device. Anything that fails here is exactly
 // what would have failed at `start`.
+#if defined(_WIN32)
 void gpuCheck(const Options& opt) {
     CaptureConfig cfg;
     cfg.target        = opt.target;
@@ -683,74 +911,87 @@ void gpuCheck(const Options& opt) {
                 "available, and --cpu forces the SSE2 path instead.\n\n",
                 opt.monitorIndex);
 }
+#else
+// The macOS GPU path is ScreenCaptureKit's IOSurface -> VTPixelTransferSession
+// (scale + BGRA->NV12 on the GPU) -> a VideoToolbox encoder. Each link is
+// checked by actually building it.
+void gpuCheck(const Options& opt) {
+    CaptureConfig cfg;
+    cfg.target        = opt.target;
+    cfg.monitorIndex  = opt.monitorIndex;
+    cfg.captureCursor = opt.cursor;
+    cfg.maxWidth      = opt.maxWidth;
+    cfg.backend       = CaptureBackend::Sck;
+    cfg.preferGpu     = true;
 
-// Windows consoles do not interpret ANSI escapes unless asked. Ask once, and
-// fall back to plain text when the handle is redirected to a file or a pipe --
-// emitting raw escape bytes into a log would be worse than no emphasis.
-bool enableAnsi() {
-    static const bool ok = [] {
-        const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
-        if (out == INVALID_HANDLE_VALUE || GetFileType(out) != FILE_TYPE_CHAR) return false;
-        DWORD mode = 0;
-        if (!GetConsoleMode(out, &mode)) return false;
-        return SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
-    }();
-    return ok;
-}
+    std::printf("\nchecking whether frames can stay on the graphics card...\n\n");
 
-bool copyToClipboard(const std::string& text) {
-    const std::wstring wide = toUtf16(text);
-    if (!OpenClipboard(nullptr)) return false;
-
-    bool ok = false;
-    if (EmptyClipboard()) {
-        const size_t bytes = (wide.size() + 1) * sizeof(wchar_t);
-        if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
-            if (void* dst = GlobalLock(mem)) {
-                std::memcpy(dst, wide.c_str(), bytes);
-                GlobalUnlock(mem);
-                ok = SetClipboardData(CF_UNICODETEXT, mem) != nullptr;
-            }
-            if (!ok) GlobalFree(mem);
-        }
+    if (opt.target == CaptureTarget::Window) {
+        cfg.windowHandle = resolveWindowSpec(opt.windowSpec);
+        if (!cfg.windowHandle) return;
     }
-    CloseClipboard();
-    return ok;
-}
 
-std::string exeDirectory() {
-    wchar_t path[MAX_PATH] = {};
-    const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
-    std::wstring_view sv(path, n);
-    const size_t slash = sv.find_last_of(L"\\/");
-    return toUtf8(slash == std::wstring_view::npos ? sv : sv.substr(0, slash));
+    auto capture = createFrameSource(cfg);
+    if (!capture->start()) {
+        std::printf("  capture     NO -- ScreenCaptureKit would not start. It needs macOS\n"
+                    "                    12.3 or later and the Screen Recording permission;\n"
+                    "                    `soi-share capture-check` says which.\n\n"
+                    "Result: the CPU pipeline.\n\n");
+        return;
+    }
+    auto device = capture->gpuDevice();
+    if (!device) {
+        capture->stop();
+        std::printf("  capture     NO -- capture started, but not with GPU-resident frames.\n\n"
+                    "Result: the CPU pipeline.\n\n");
+        return;
+    }
+    std::printf("  capture     yes -- %s\n", device->describe().c_str());
+
+    H264Encoder probe;
+    const bool takesGpu = probe.enableGpuInput(device);
+    std::printf("  encoder     %s -- %s\n", takesGpu ? "yes" : "NO ", probe.describe().c_str());
+    if (!takesGpu) {
+        capture->stop();
+        std::printf("\n  No hardware H.264 encoder is available, so frames are encoded in\n"
+                    "  software from system memory.\n\n"
+                    "Result: the CPU pipeline.\n\n");
+        return;
+    }
+
+    Nv12GpuConverter conv;
+    const int w = capture->width() & ~1, h = capture->height() & ~1;
+    const bool converter = conv.init(device, w, h);
+    std::printf("  converter   %s -- BGRA to NV12 at %dx%d\n", converter ? "yes" : "NO ", w, h);
+    conv.reset();
+    capture->stop();
+    if (!converter) {
+        std::printf("\n  The GPU pixel-transfer session could not be created, so the\n"
+                    "  conversion has to happen on the CPU.\n\n"
+                    "Result: the CPU pipeline.\n\n");
+        return;
+    }
+    std::printf("\nResult: the GPU pipeline. `soi-share start` uses it automatically;\n"
+                "--gpu makes it an error if it ever stops being available, and --cpu\n"
+                "forces the CPU path instead.\n\n");
 }
+#endif
+
+std::string exeDirectory() { return directoryOf(currentExePath()); }
 
 bool readFileText(const std::string& path, std::string& out) {
-    out.clear();
-    HANDLE h = CreateFileW(toUtf16(path).c_str(), GENERIC_READ, FILE_SHARE_READ,
-                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    char  buf[16384];
-    DWORD got = 0;
-    while (ReadFile(h, buf, sizeof buf, &got, nullptr) && got > 0) out.append(buf, got);
-    CloseHandle(h);
-    return !out.empty();
+    return readFileBytes(path, out) && !out.empty();
 }
 
 bool embeddedViewer(std::string& out) {
     return loadEmbeddedResource(kViewerResourceId, out);
 }
 
-bool fileExists(const std::string& path) {
-    const DWORD attrs = GetFileAttributesW(toUtf16(path).c_str());
-    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
-}
-
 // file:// URL with the offer in the fragment. Browsers never transmit a
 // fragment, and this is a local file regardless.
 std::string buildViewerUrl(const std::string& viewerPath, const std::string& blob) {
-    std::string url = "file:///";
+    // "file:///C:/x" on Windows; a POSIX path already starts with the slash.
+    std::string url = viewerPath.rfind("/", 0) == 0 ? "file://" : "file:///";
     for (char c : viewerPath) {
         if (c == '\\')      url += '/';
         else if (c == ' ')  url += "%20";
@@ -763,19 +1004,24 @@ std::string buildViewerUrl(const std::string& viewerPath, const std::string& blo
 }
 
 // A high-resolution waitable timer keeps frame pacing tight. The default Windows
-// timer granularity is ~15.6ms, which at 30fps would alias badly.
+// timer granularity is ~15.6ms, which at 30fps would alias badly. macOS timers
+// are already sub-millisecond, so a plain sleep is as good there.
 class FramePacer {
 public:
     explicit FramePacer(int fps)
         : interval_(std::chrono::nanoseconds(1'000'000'000LL / std::max(1, fps))) {
         fps_ = std::max(1, fps);
+#if defined(_WIN32)
         timer_ = CreateWaitableTimerExW(nullptr, nullptr,
                                         CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                                         TIMER_ALL_ACCESS);
         if (!timer_) timer_ = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+#endif
         next_ = std::chrono::steady_clock::now();
     }
+#if defined(_WIN32)
     ~FramePacer() { if (timer_) CloseHandle(timer_); }
+#endif
     FramePacer(const FramePacer&) = delete;
     FramePacer& operator=(const FramePacer&) = delete;
 
@@ -796,6 +1042,7 @@ public:
         if (next_ < now) { next_ = now; return; }   // fell behind: do not spiral
 
         const auto delay = next_ - now;
+#if defined(_WIN32)
         if (!timer_) { std::this_thread::sleep_for(delay); return; }
 
         LARGE_INTEGER due;
@@ -805,10 +1052,15 @@ public:
             WaitForSingleObject(timer_, INFINITE);
         else
             std::this_thread::sleep_for(delay);
+#else
+        std::this_thread::sleep_until(next_);
+#endif
     }
 
 private:
+#if defined(_WIN32)
     HANDLE                                timer_ = nullptr;
+#endif
     std::chrono::nanoseconds              interval_;
     std::chrono::steady_clock::time_point next_;
     int                                   fps_ = 30;
@@ -902,6 +1154,19 @@ public:
 
     void stopEncoder() { encoder_.stop(); }
 
+    // The capture has moved onto a backend whose frames live on the GPU (it
+    // climbed back to the best one after an outage), but the encoder was built
+    // for system-memory input. Rebuild it so it is offered the GPU path again.
+    bool restartEncoder() {
+        // Once per device: if the rebuilt encoder still refuses GPU input,
+        // rebuilding again on every frame would only spin.
+        const auto dev = capture_.gpuDevice();
+        if (!dev || dev.get() == gpuRebuildTried_) return true;
+        gpuRebuildTried_ = dev.get();
+        encoder_.stop();
+        return startEncoder();
+    }
+
     // Applies anything the other threads asked for. Returns false if a rebuild
     // was needed and failed, which ends the session.
     bool tick() {
@@ -950,7 +1215,11 @@ public:
 
     bool submit(const Nv12Buffer& frame, int64_t ptsNs) { return encoder_.submit(frame, ptsNs); }
     bool submitTexture(void* bgra, int64_t ptsNs) {
+#if defined(_WIN32)
         return encoder_.submitTexture(static_cast<ID3D11Texture2D*>(bgra), ptsNs);
+#else
+        return encoder_.submitTexture(bgra, ptsNs);   // a CVPixelBufferRef
+#endif
     }
     bool onGpu() const { return encoder_.usesGpuInput(); }
     void requestKeyframe() { encoder_.requestKeyframe(); }
@@ -1188,6 +1457,9 @@ private:
     // Capture thread only, so it needs no synchronisation of its own; it is read
     // inside tick()'s lock merely because that is where the pending request is.
     std::chrono::steady_clock::time_point lastSwitch_{};
+
+    // Identity only: the GPU device restartEncoder() last rebuilt for.
+    const GpuDevice* gpuRebuildTried_ = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -1241,6 +1513,10 @@ void runCaptureLoop(FrameSource& capture, QualityDirector& director, Streamer& s
                 // inside that same shader pass.
                 director.submitTexture(frame->gpuTexture, frame->timeNs);
                 lastSent = now;
+            } else if (frame->gpuTexture && !frame->data) {
+                // GPU-only frames, but an encoder that cannot take them.
+                logI("capture moved to a GPU-resident backend; rebuilding the encoder for it");
+                if (!director.restartEncoder()) break;
             } else if (frame->data) {
                 // Frames arrive at native resolution; the conversion pass box
                 // filters down to the ENCODER's current size in the same sweep,
@@ -1351,7 +1627,7 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
              "the graphics card");
     else
         logI("pipeline: CPU -- {} colour conversion, {} worker(s)",
-             colorConvertUsesSimd() ? "SSSE3" : "scalar", sharedPool().size());
+             colorConvertSimdName(), sharedPool().size());
 
     // Say plainly, in the log, how much of this machine the far end can reach.
     // "What am I actually sharing" should never need reasoning about.
@@ -1471,7 +1747,7 @@ int runOneSession(const Options& opt, bool daemon, const std::string& shareCode,
     clearLive("urls");
     if (opt.http) {
         std::string viewerHtml;
-        if (readFileText(exeDirectory() + "\\viewer.html", viewerHtml) ||
+        if (readFileText(joinPath(exeDirectory(), "viewer.html"), viewerHtml) ||
             embeddedViewer(viewerHtml)) {
             const bool up = handover.start(
                 opt.httpPort, viewerHtml, blob,
@@ -1886,7 +2162,8 @@ bool printJoinInfo(const std::map<std::string, std::string>& live) {
 }
 
 void printControlHint() {
-    std::printf("\n  next:  soi-share status     soi-share stop     soi-share help\n");
+    const std::string c = selfCommand();
+    std::printf("\n  next:  %s status     %s stop     %s help\n", c.c_str(), c.c_str(), c.c_str());
 }
 
 std::string describeUptime(long long secs) {
@@ -1966,8 +2243,17 @@ int runInstance(const Options& opt, const std::vector<std::string>& args) {
     setLive("args", joinQuoted(args));
     setLive("log", logPath);
     setDaemonState(DaemonState::Starting);
-    g_attached = GetConsoleWindow() != nullptr;
+    g_attached = attachedToTerminal();
     logSetVerbose(opt.verbose);
+#if !defined(_WIN32)
+    if (!g_attached) {
+        // The background copy. spawnDetached already started it in a session
+        // of its own; this makes sure of it on systems where posix_spawn could
+        // not, so the launching terminal closing can never reach it.
+        setsid();
+        std::signal(SIGHUP, SIG_IGN);
+    }
+#endif
 
     std::string error;
     if (!startControlServer(appVersion(), error)) {
@@ -1975,7 +2261,7 @@ int runInstance(const Options& opt, const std::vector<std::string>& args) {
         closeStopEvent();
         return 1;
     }
-    logI("--- soi-share {} starting (pid {}, {}) ---", appVersion(), GetCurrentProcessId(),
+    logI("--- soi-share {} starting (pid {}, {}) ---", appVersion(), currentProcessId(),
          g_attached ? "in a terminal" : "no console");
 
     const int rc = runSession(opt, true);
@@ -2001,6 +2287,28 @@ int cmdStart(int argc, char** argv) {
         return 2;
     }
     const std::vector<std::string> args = sessionArgs(argc, argv, 2);
+
+#if defined(__APPLE__)
+    // Ask for Screen Recording HERE, in the terminal, not in the background
+    // copy: macOS attributes the permission to the terminal app, shows its
+    // prompt only to something with a terminal, and only applies a new grant
+    // once the terminal app has been restarted. Finding out now beats a share
+    // whose viewer sees nothing but a black rectangle.
+    if (!screenCapturePermitted(/*prompt=*/true)) {
+        std::printf(
+            "\nsoi-share needs the Screen Recording permission, which macOS grants to\n"
+            "your terminal app (Terminal, iTerm, VS Code, ...):\n\n"
+            "  1. Open System Settings > Privacy & Security > Screen Recording\n"
+            "     (macOS 15: \"Screen & System Audio Recording\").\n"
+            "  2. Turn it on for your terminal app. If it is not listed, click +\n"
+            "     and add it from Applications (Utilities, for Terminal).\n"
+            "  3. QUIT the terminal app completely (Cmd+Q) and open it again --\n"
+            "     macOS only applies the permission to a freshly started app.\n"
+            "  4. Run `%s start` again.\n\n", selfCommand().c_str());
+        return 1;
+    }
+#endif
+
     if (opt.foreground) return runInstance(opt, args);
 
     const std::string logPath = opt.logFile.empty() ? defaultLogPath() : opt.logFile;
@@ -2054,18 +2362,16 @@ int cmdStart(int argc, char** argv) {
                         ? "  (NOT encrypted -- it reveals your IP addresses; use --pass)"
                         : "  (AES-256-GCM encrypted)");
 
-        const std::string viewerPath = exeDirectory() + "\\viewer.html";
+        const std::string viewerPath = joinPath(exeDirectory(), "viewer.html");
         if (fileExists(viewerPath))
             std::printf("  viewer.html: %s\n", viewerPath.c_str());
     }
 
     // Opening a browser here would put a window on the very screen being shared,
     // so it is strictly opt-in.
-    const std::string viewerPath = exeDirectory() + "\\viewer.html";
+    const std::string viewerPath = joinPath(exeDirectory(), "viewer.html");
     if (opt.openViewer && fileExists(viewerPath) && !blob.empty()) {
-        ShellExecuteW(nullptr, L"open",
-                      toUtf16(buildViewerUrl(viewerPath, blob)).c_str(),
-                      nullptr, nullptr, SW_SHOWNORMAL);
+        openUrl(buildViewerUrl(viewerPath, blob));
         std::printf("  (viewer also opened locally, as requested)\n");
     }
 
@@ -2209,6 +2515,7 @@ int cmdPurge() {
     return 0;
 }
 
+#if defined(_WIN32)
 // Double-clicked in Explorer. A terminal program opened that way gets a console
 // of its own that closes the instant it exits, so: install, say what this is
 // and how to use it, and wait for Enter.
@@ -2242,6 +2549,7 @@ int doubleClicked(int argc, char** argv) {
     }
     return rc;
 }
+#endif
 
 bool hasFlag(int argc, char** argv, const char* flag) {
     for (int i = 2; i < argc; ++i)
@@ -2266,17 +2574,25 @@ bool onlyFlags(int argc, char** argv, std::initializer_list<const char*> allowed
 } // namespace
 
 int main(int argc, char** argv) {
+#if defined(_WIN32)
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     SetConsoleCtrlHandler(consoleHandler, TRUE);
+#else
+    std::signal(SIGINT, signalHandler);
+    std::signal(SIGTERM, signalHandler);
+    std::signal(SIGHUP, signalHandler);
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
 
     // An exe that `update` or `install` moved aside is deleted on the next run
     // of any command, once nothing is executing it any more.
     cleanupOldBinaries();
 
+    const std::string cmd = argc > 1 ? argv[1] : "";
+
+#if defined(_WIN32)
     const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(coHr)) { logE("CoInitializeEx failed: {}", hrString(coHr)); return 1; }
-
-    const std::string cmd = argc > 1 ? argv[1] : "";
 
     // Media Foundation only for the commands that capture or encode. "N"
     // editions of Windows ship without it, and install / update / help must
@@ -2298,16 +2614,26 @@ int main(int argc, char** argv) {
         }
         mediaUp = true;
     }
+#endif
 
     int rc = 0;
 
+#if defined(_WIN32)
     // Double-clicked in Explorer: no arguments, and the console was created for
     // this process alone.
     DWORD consolePids[2] = {};
     const bool ownConsole = GetConsoleProcessList(consolePids, 2) == 1;
+#else
+    // Double-clicked in Finder opens a Terminal window in the home folder and
+    // runs this with no arguments. The usage text says how to run it from its
+    // own folder, so nothing special is needed.
+    const bool ownConsole = false;
+#endif
 
     if (cmd.empty() && ownConsole) {
+#if defined(_WIN32)
         rc = doubleClicked(argc, argv);
+#endif
     } else if (cmd.empty() || cmd == "--help" || cmd == "-h" || cmd == "help" || cmd == "/?") {
         printUsage();
     } else if (cmd == "version" || cmd == "--version" || cmd == "-v") {
@@ -2315,9 +2641,7 @@ int main(int argc, char** argv) {
     } else if (cmd == "install") {
         // install.ps1 fixes up its own session's PATH, so the exe's "open a
         // new terminal" advice would be wrong there.
-        wchar_t fromScript[4] = {};
-        const bool quiet = GetEnvironmentVariableW(L"SOI_SHARE_INSTALLER", fromScript, 4) == 1 &&
-                           fromScript[0] == L'1';
+        const bool quiet = envVar("SOI_SHARE_INSTALLER") == "1";
         rc = onlyFlags(argc, argv, {}) ? cmdInstall(quiet) : 2;
     } else if (cmd == "uninstall") {
         rc = onlyFlags(argc, argv, {"--purge"}) ? cmdUninstall(hasFlag(argc, argv, "--purge")) : 2;
@@ -2373,7 +2697,9 @@ int main(int argc, char** argv) {
         rc = 2;
     }
 
+#if defined(_WIN32)
     if (mediaUp) MFShutdown();
     CoUninitialize();
+#endif
     return rc;
 }

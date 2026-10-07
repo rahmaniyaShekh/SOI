@@ -1,12 +1,21 @@
 #include "app/Control.h"
 #include "app/Service.h"
+#include "util/Crypto.h"
 #include "util/Log.h"
-#include "util/Win.h"
+#include "util/Platform.h"
+#include "util/Socket.h"
 
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#include <bcrypt.h>
+#if defined(_WIN32)
+  #include "util/Win.h"
+#else
+  #include <climits>
+  #include <csignal>
+  #include <cstdlib>
+  #include <sys/wait.h>
+  #if defined(__APPLE__)
+    #include <libproc.h>
+  #endif
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -25,25 +34,6 @@ std::string                           g_secret;
 std::string                           g_version;
 std::chrono::steady_clock::time_point g_started;
 long long                             g_startedUnix = 0;
-
-bool ensureWinsock() {
-    static const bool ok = [] {
-        WSADATA wsa{};
-        return WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
-    }();
-    return ok;
-}
-
-std::string randomHex(size_t bytes) {
-    std::string raw(bytes, '\0');
-    if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(raw.data()),
-                        static_cast<ULONG>(raw.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
-        return {};
-    static const char* kHex = "0123456789abcdef";
-    std::string out;
-    for (unsigned char c : raw) { out += kHex[c >> 4]; out += kHex[c & 15]; }
-    return out;
-}
 
 // Constant-time: the secret is compared against whatever a local process sends.
 bool sameSecret(const std::string& a, const std::string& b) {
@@ -66,7 +56,7 @@ void sendAll(SOCKET s, const std::string& data) {
 std::map<std::string, std::string> statusReply() {
     std::map<std::string, std::string> kv;
     for (const auto& [k, v] : liveSnapshot()) kv[k] = v;
-    kv["pid"]     = std::to_string(GetCurrentProcessId());
+    kv["pid"]     = std::to_string(currentProcessId());
     kv["version"] = g_version;
     kv["exe"]     = currentExePath();
     kv["started"] = std::to_string(g_startedUnix);
@@ -76,9 +66,7 @@ std::map<std::string, std::string> statusReply() {
 }
 
 void handleClient(SOCKET client) {
-    const DWORD timeout = 2000;
-    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof timeout);
-    setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof timeout);
+    setSocketTimeouts(client, 2000);
 
     std::string line;
     char buf[4096];
@@ -103,7 +91,7 @@ void handleClient(SOCKET client) {
         reply["error"] = "denied";
     } else if (command == "ping") {
         reply["ok"]  = "1";
-        reply["pid"] = std::to_string(GetCurrentProcessId());
+        reply["pid"] = std::to_string(currentProcessId());
     } else if (command == "status") {
         reply = statusReply();
         reply["ok"] = "1";
@@ -131,9 +119,16 @@ void serveLoop() {
     for (;;) {
         const SOCKET listener = g_listener.load();
         if (listener == INVALID_SOCKET) return;
+        // Polled, so stopControlServer() is noticed within a fraction of a
+        // second on every platform.
+        const int ready = waitReadable(listener, 200);
+        if (g_listener.load() == INVALID_SOCKET) return;
+        if (ready <= 0) {
+            if (ready < 0) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
         const SOCKET client = accept(listener, nullptr, nullptr);
         if (client == INVALID_SOCKET) {
-            // closesocket() on the listener is how stopControlServer wakes us.
             if (g_listener.load() == INVALID_SOCKET) return;
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
@@ -145,14 +140,40 @@ void serveLoop() {
 bool sameImage(std::string a, std::string b) {
     // A running exe that `update` renamed aside keeps running as *.old.
     auto strip = [](std::string& s) {
-        if (s.size() > 4 && _stricmp(s.c_str() + s.size() - 4, ".old") == 0) s.resize(s.size() - 4);
+        if (s.size() > 4 && equalsNoCase(std::string_view(s).substr(s.size() - 4), ".old"))
+            s.resize(s.size() - 4);
     };
     strip(a);
     strip(b);
+#if defined(_WIN32)
     const std::wstring wa = toUtf16(a), wb = toUtf16(b);
     return CompareStringOrdinal(wa.c_str(), static_cast<int>(wa.size()),
                                 wb.c_str(), static_cast<int>(wb.size()), TRUE) == CSTR_EQUAL;
+#else
+    // Resolve symlinks and relative parts so two spellings of one file match.
+    auto canonical = [](const std::string& p) {
+        char buf[PATH_MAX];
+        return realpath(p.c_str(), buf) ? std::string(buf) : p;
+    };
+    return a == b || canonical(a) == canonical(b);
+#endif
 }
+
+#if !defined(_WIN32)
+// The executable a live pid is running, or empty if that cannot be read.
+std::string imageOfPid(unsigned long pid) {
+#if defined(__APPLE__)
+    char buf[PROC_PIDPATHINFO_MAXSIZE] = {};
+    if (proc_pidpath(static_cast<int>(pid), buf, sizeof buf) > 0) return buf;
+#else
+    char buf[PATH_MAX] = {};
+    const std::string link = "/proc/" + std::to_string(pid) + "/exe";
+    const ssize_t n = readlink(link.c_str(), buf, sizeof buf - 1);
+    if (n > 0) return std::string(buf, static_cast<size_t>(n));
+#endif
+    return {};
+}
+#endif
 
 } // namespace
 
@@ -202,15 +223,17 @@ bool parseInstanceRecord(const std::string& text, InstanceRecord& out) {
 }
 
 bool startControlServer(const std::string& version, std::string& error) {
-    if (!ensureWinsock()) { error = "Winsock would not start"; return false; }
+    if (!socketsReady()) { error = "the socket layer would not start"; return false; }
 
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) { error = "could not create the control socket"; return false; }
 
+#if defined(_WIN32)
     // Nobody else may bind the same port while we hold it.
     BOOL exclusive = TRUE;
     setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
                reinterpret_cast<const char*>(&exclusive), sizeof exclusive);
+#endif
 
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
@@ -221,7 +244,7 @@ bool startControlServer(const std::string& version, std::string& error) {
         closesocket(s);
         return false;
     }
-    int len = sizeof addr;
+    SockLen len = sizeof addr;
     getsockname(s, reinterpret_cast<sockaddr*>(&addr), &len);
 
     g_secret      = randomHex(16);
@@ -236,7 +259,7 @@ bool startControlServer(const std::string& version, std::string& error) {
     // Written only once the socket is listening, so a record that exists always
     // points at a channel that answers -- `start` waits on exactly that.
     const std::string record = serializeKeyValues({
-        {"pid",     std::to_string(GetCurrentProcessId())},
+        {"pid",     std::to_string(currentProcessId())},
         {"port",    std::to_string(ntohs(addr.sin_port))},
         {"secret",  g_secret},
         {"exe",     currentExePath()},
@@ -253,21 +276,25 @@ bool startControlServer(const std::string& version, std::string& error) {
 }
 
 void stopControlServer() {
+    // The serving thread polls g_listener, so it is joined BEFORE the socket is
+    // closed: closing a descriptor another thread may still be waiting on lets
+    // the number be reused underneath it.
     const SOCKET s = g_listener.exchange(INVALID_SOCKET);
-    if (s != INVALID_SOCKET) closesocket(s);
     if (g_server.joinable()) g_server.join();
+    if (s != INVALID_SOCKET) closesocket(s);
 
     // Only delete the record if it is still ours: a second instance may have
     // started after this one began shutting down.
     std::string text;
     InstanceRecord rec;
     if (readStateFile(kInstanceFile, text) && parseInstanceRecord(text, rec) &&
-        rec.pid == GetCurrentProcessId())
+        rec.pid == currentProcessId())
         removeStateFile(kInstanceFile);
 }
 
 bool processAlive(unsigned long pid, const std::string& exe) {
     if (pid == 0) return false;
+#if defined(_WIN32)
     HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!proc) return false;
 
@@ -286,6 +313,23 @@ bool processAlive(unsigned long pid, const std::string& exe) {
     }
     CloseHandle(proc);
     return alive;
+#else
+    // A child of ours that has already exited is a zombie until reaped, and
+    // kill(pid, 0) still succeeds on a zombie. Reap it first so `start` sees a
+    // background copy that died as dead. Harmless for any other pid.
+    int status = 0;
+    if (waitpid(static_cast<pid_t>(pid), &status, WNOHANG) == static_cast<pid_t>(pid))
+        return false;
+    if (kill(static_cast<pid_t>(pid), 0) != 0 && errno != EPERM) return false;
+
+    // A recycled pid belonging to something else must never count as ours, or
+    // `stop --force` would kill an unrelated program.
+    if (!exe.empty()) {
+        const std::string image = imageOfPid(pid);
+        if (!image.empty() && !sameImage(image, exe)) return false;
+    }
+    return true;
+#endif
 }
 
 FoundInstance findInstance() {
@@ -319,18 +363,16 @@ FoundInstance findInstance() {
 bool controlRequest(const InstanceRecord& rec, const std::string& command,
                     std::map<std::string, std::string>& reply, int timeoutMs) {
     reply.clear();
-    if (!ensureWinsock() || rec.port <= 0) return false;
+    if (!socketsReady() || rec.port <= 0) return false;
 
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return false;
-    const DWORD timeout = static_cast<DWORD>(timeoutMs);
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof timeout);
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof timeout);
+    setSocketTimeouts(s, timeoutMs);
 
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port        = htons(static_cast<u_short>(rec.port));
+    addr.sin_port        = htons(static_cast<uint16_t>(rec.port));
     if (connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) {
         closesocket(s);
         return false;

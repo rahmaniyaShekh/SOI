@@ -3,17 +3,19 @@
 // Detached-process control.
 //
 // soi-share runs headless: no window, no console, no GUI. `start` relaunches
-// this exe as `start --foreground --log-file <path>` with DETACHED_PROCESS, so
-// closing the terminal that started it does not kill it, and every control verb
-// (status/offer/answer/stop) works from any other terminal in the same user
-// session.
+// this exe as `start --foreground --log-file <path>` fully detached --
+// DETACHED_PROCESS on Windows, a new session (setsid) with no terminal on
+// macOS -- so closing the terminal that started it does not kill it, and every
+// control verb (status/offer/answer/stop) works from any other terminal in the
+// same user session.
 //
 // What the running instance is doing lives in ITS memory (setLive / the answer
 // slot below) and is read back over the loopback control channel in
 // app/Control.h -- never from a file written at startup, which goes stale the
 // moment the process crashes.
 //
-// Files in %LOCALAPPDATA%\soi-share:
+// Files in the state directory -- %LOCALAPPDATA%\soi-share on Windows,
+// ~/Library/Application Support/soi-share on macOS:
 //
 //   machine.code   this PC's persistent share code (the per-device identity)
 //   instance.txt   pid, control port and secret of the running instance
@@ -21,7 +23,7 @@
 //
 // Shutdown is cooperative: `stop` asks over the control channel, which sets the
 // same event a console Ctrl+C would, and only `stop --force` escalates to
-// TerminateProcess.
+// TerminateProcess (SIGKILL on macOS).
 //
 #include <string>
 #include <utility>
@@ -92,14 +94,21 @@ void closeStopEvent();
 
 // --- spawning ---------------------------------------------------------------
 
-// Relaunches this executable with exactly `args`, fully detached
-// (DETACHED_PROCESS: no console at all) and with the state directory as its
-// working directory, so it never pins the folder the user launched it from.
-// Returns the child pid, or 0.
+// Relaunches this executable with exactly `args`, fully detached (no console or
+// controlling terminal at all) and with the state directory as its working
+// directory, so it never pins the folder the user launched it from. Returns
+// the child pid, or 0.
 unsigned long spawnDetached(const std::vector<std::string>& args);
 
+#if defined(_WIN32)
 // Quotes one argument so CommandLineToArgvW / the CRT reproduce it exactly.
 std::wstring quoteArg(const std::string& arg);
+#endif
+
+// One argument quoted for this platform's command line, as UTF-8: the CRT's
+// rules on Windows, POSIX shell quoting elsewhere. A string of these joined by
+// spaces is what `stop`/`update` hand back to `start` to restart a share.
+std::string quoteArgument(const std::string& arg);
 
 // Absolute path of this executable.
 std::string currentExePath();

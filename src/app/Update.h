@@ -2,9 +2,9 @@
 //
 // Self-update from GitHub Releases.
 //
-// The release carries soi-share.exe and SHA256SUMS.txt. An exe is only ever
-// installed if its SHA-256 matches the published sum; there is no "skip
-// verification" switch.
+// The release carries soi-share.exe (Windows), soi-share-macos.zip (macOS) and
+// SHA256SUMS.txt. A binary is only ever installed if its SHA-256 matches the
+// published sum; there is no "skip verification" switch.
 //
 // A private repository returns 404 to anonymous requests, so the updater can
 // authenticate with a read-only token. Where it comes from, in order:
@@ -13,7 +13,8 @@
 //   2. GH_TOKEN, GITHUB_TOKEN   -- used for this run only, never saved: on a
 //                                  developer's machine they are usually
 //                                  broad-scope tokens.
-//   3. the saved token          -- DPAPI-encrypted for this Windows user.
+//   3. the saved token          -- DPAPI-encrypted for this Windows user, or
+//                                  in the login Keychain on macOS.
 //   4. a hidden prompt, once.
 //
 // A token is saved only if it is a fine-grained token (github_pat_...). A
@@ -57,12 +58,22 @@ enum class TokenKind { FineGrained, Classic, OAuth, Other };
 TokenKind   classifyToken(const std::string& token);
 const char* describeTokenKind(TokenKind kind);
 
+#if defined(_WIN32)
 // DPAPI (CryptProtectData) bound to the current Windows user, with
 // application-specific entropy so another program's DPAPI blob can't be
 // passed off as ours. Tampering makes unprotect fail.
 bool protectSecret(const std::string& plain, std::string& blob);
 bool unprotectSecret(const std::string& blob, std::string& plain);
+#else
+// A generic password in the user's login Keychain, service "soi-share", under
+// `account`. Like a DPAPI blob it is readable by this user's processes and by
+// nobody else; unlike a file it is never on disk in clear. See Keychain_mac.cpp.
+bool keychainStore(const std::string& account, const std::string& secret);
+bool keychainLoad(const std::string& account, std::string& secret);
+bool keychainDelete(const std::string& account);   // true if one was deleted
+#endif
 
+// Where the saved token lives, for messages.
 std::string tokenFilePath();
 bool saveToken(const std::string& token);
 bool loadSavedToken(std::string& token);

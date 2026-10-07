@@ -1,18 +1,12 @@
 #include "net/SignalBlob.h"
+#include "util/Crypto.h"
 #include "util/Log.h"
 
 #include <miniz.h>
 
-#include <windows.h>
-#include <bcrypt.h>
-
 #include <array>
 #include <cstring>
 #include <vector>
-
-#ifndef NT_SUCCESS
-#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
-#endif
 
 namespace soi {
 namespace {
@@ -23,7 +17,7 @@ constexpr size_t   kSaltLen       = 16;
 constexpr size_t   kIvLen         = 12;
 constexpr size_t   kTagLen        = 16;
 constexpr size_t   kKeyLen        = 32;
-constexpr ULONGLONG kPbkdf2Iters  = 200000;
+constexpr unsigned kPbkdf2Iters   = 200000;
 
 constexpr char kB64Chars[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -64,143 +58,32 @@ bool inflateRaw(const void* src, size_t srcLen, std::string& out) {
 }
 
 // ---------------------------------------------------------------------------
-// Crypto via Windows CNG (bcrypt).
-//
-// This is deliberately not OpenSSL: the sender is Windows-only anyway, and CNG
-// removes a heavyweight external dependency from the signalling path. The wire
-// format is unchanged, so it still interoperates byte-for-byte with the
-// viewer's WebCrypto implementation.
+// AES-256-GCM over PBKDF2-HMAC-SHA256, through util/Crypto.h (CNG on Windows,
+// OpenSSL on macOS). The wire format is the same on both, so it interoperates
+// byte-for-byte with the viewer's WebCrypto implementation.
 // ---------------------------------------------------------------------------
-
-// RAII for a CNG algorithm provider.
-class AlgHandle {
-public:
-    AlgHandle(LPCWSTR algId, ULONG flags) {
-        if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&h_, algId, nullptr, flags)))
-            h_ = nullptr;
-    }
-    ~AlgHandle() { if (h_) BCryptCloseAlgorithmProvider(h_, 0); }
-    AlgHandle(const AlgHandle&) = delete;
-    AlgHandle& operator=(const AlgHandle&) = delete;
-
-    BCRYPT_ALG_HANDLE get() const { return h_; }
-    explicit operator bool() const { return h_ != nullptr; }
-
-private:
-    BCRYPT_ALG_HANDLE h_ = nullptr;
-};
-
-class KeyHandle {
-public:
-    ~KeyHandle() { if (h_) BCryptDestroyKey(h_); }
-    KeyHandle() = default;
-    KeyHandle(const KeyHandle&) = delete;
-    KeyHandle& operator=(const KeyHandle&) = delete;
-
-    BCRYPT_KEY_HANDLE* put() { return &h_; }
-    BCRYPT_KEY_HANDLE  get() const { return h_; }
-    explicit operator bool() const { return h_ != nullptr; }
-
-private:
-    BCRYPT_KEY_HANDLE h_ = nullptr;
-};
-
-bool randomBytes(uint8_t* out, size_t len) {
-    return NT_SUCCESS(BCryptGenRandom(nullptr, out, static_cast<ULONG>(len),
-                                      BCRYPT_USE_SYSTEM_PREFERRED_RNG));
-}
 
 bool deriveKey(std::string_view passphrase, const uint8_t* salt,
                std::array<uint8_t, kKeyLen>& key) {
-    AlgHandle alg(BCRYPT_SHA256_ALGORITHM, BCRYPT_ALG_HANDLE_HMAC_FLAG);
-    if (!alg) return false;
-
-    return NT_SUCCESS(BCryptDeriveKeyPBKDF2(
-        alg.get(),
-        reinterpret_cast<PUCHAR>(const_cast<char*>(passphrase.data())),
-        static_cast<ULONG>(passphrase.size()),
-        const_cast<PUCHAR>(salt), static_cast<ULONG>(kSaltLen),
-        kPbkdf2Iters, key.data(), static_cast<ULONG>(kKeyLen), 0));
-}
-
-// Opens AES in GCM chaining mode and imports the derived key.
-bool makeGcmKey(const std::array<uint8_t, kKeyLen>& key, AlgHandle& alg,
-                KeyHandle& outKey) {
-    if (!alg) return false;
-
-    if (!NT_SUCCESS(BCryptSetProperty(
-            alg.get(), BCRYPT_CHAINING_MODE,
-            reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
-            sizeof(BCRYPT_CHAIN_MODE_GCM), 0)))
-        return false;
-
-    return NT_SUCCESS(BCryptGenerateSymmetricKey(
-        alg.get(), outKey.put(), nullptr, 0,
-        const_cast<PUCHAR>(key.data()), static_cast<ULONG>(kKeyLen), 0));
+    return pbkdf2HmacSha256(passphrase, salt, kSaltLen, kPbkdf2Iters, key.data(), kKeyLen);
 }
 
 bool gcmEncrypt(const std::array<uint8_t, kKeyLen>& key, const uint8_t* iv,
                 const uint8_t* aad, size_t aadLen,
                 const std::vector<uint8_t>& plain,
                 std::vector<uint8_t>& cipher, uint8_t tag[kTagLen]) {
-    AlgHandle alg(BCRYPT_AES_ALGORITHM, 0);
-    KeyHandle hKey;
-    if (!makeGcmKey(key, alg, hKey)) return false;
-
-    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
-    BCRYPT_INIT_AUTH_MODE_INFO(info);
-    info.pbNonce    = const_cast<PUCHAR>(iv);
-    info.cbNonce    = static_cast<ULONG>(kIvLen);
-    info.pbAuthData = const_cast<PUCHAR>(aad);
-    info.cbAuthData = static_cast<ULONG>(aadLen);
-    info.pbTag      = tag;
-    info.cbTag      = static_cast<ULONG>(kTagLen);
-
     cipher.resize(plain.size());
-    ULONG written = 0;
-
-    // In authenticated modes the nonce travels in the mode info, so pbIV is null.
-    const NTSTATUS st = BCryptEncrypt(
-        hKey.get(), const_cast<PUCHAR>(plain.data()), static_cast<ULONG>(plain.size()),
-        &info, nullptr, 0,
-        cipher.empty() ? nullptr : cipher.data(), static_cast<ULONG>(cipher.size()),
-        &written, 0);
-
-    if (!NT_SUCCESS(st)) return false;
-    cipher.resize(written);
-    return true;
+    return aes256GcmEncrypt(key.data(), iv, kIvLen, aad, aadLen, plain.data(), plain.size(),
+                            cipher.data(), tag);
 }
 
 bool gcmDecrypt(const std::array<uint8_t, kKeyLen>& key, const uint8_t* iv,
                 const uint8_t* aad, size_t aadLen,
                 const uint8_t* cipher, size_t cipherLen,
                 const uint8_t* tag, std::vector<uint8_t>& plain) {
-    AlgHandle alg(BCRYPT_AES_ALGORITHM, 0);
-    KeyHandle hKey;
-    if (!makeGcmKey(key, alg, hKey)) return false;
-
-    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
-    BCRYPT_INIT_AUTH_MODE_INFO(info);
-    info.pbNonce    = const_cast<PUCHAR>(iv);
-    info.cbNonce    = static_cast<ULONG>(kIvLen);
-    info.pbAuthData = const_cast<PUCHAR>(aad);
-    info.cbAuthData = static_cast<ULONG>(aadLen);
-    info.pbTag      = const_cast<PUCHAR>(tag);
-    info.cbTag      = static_cast<ULONG>(kTagLen);
-
     plain.resize(cipherLen);
-    ULONG written = 0;
-
-    // Returns STATUS_AUTH_TAG_MISMATCH when the tag does not verify.
-    const NTSTATUS st = BCryptDecrypt(
-        hKey.get(), const_cast<PUCHAR>(cipher), static_cast<ULONG>(cipherLen),
-        &info, nullptr, 0,
-        plain.empty() ? nullptr : plain.data(), static_cast<ULONG>(plain.size()),
-        &written, 0);
-
-    if (!NT_SUCCESS(st)) return false;
-    plain.resize(written);
-    return true;
+    return aes256GcmDecrypt(key.data(), iv, kIvLen, aad, aadLen, cipher, cipherLen, tag,
+                            plain.data());
 }
 
 } // namespace
@@ -277,7 +160,7 @@ std::string encodeSignalBlob(std::string_view sdp, std::string_view passphrase) 
 
     uint8_t salt[kSaltLen], iv[kIvLen];
     if (!randomBytes(salt, kSaltLen) || !randomBytes(iv, kIvLen)) {
-        logE("signal blob: BCryptGenRandom failed; refusing to emit a weakly-keyed blob");
+        logE("signal blob: the system random generator failed; refusing to emit a weakly-keyed blob");
         return {};
     }
 

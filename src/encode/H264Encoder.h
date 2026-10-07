@@ -1,7 +1,9 @@
 ﻿#pragma once
 //
-// Media Foundation H.264 encoder.
+// H.264 encoder: Media Foundation on Windows (below), VideoToolbox on macOS
+// (encode/H264EncoderMac.h, the same class and interface).
 //
+// Windows:
 // Prefers a hardware MFT (NVENC / Quick Sync / AMF) and falls back to the
 // Microsoft software encoder. Hardware MFTs are ASYNCHRONOUS -- they must be
 // unlocked with MF_TRANSFORM_ASYNC_UNLOCK and driven by an event loop rather
@@ -10,8 +12,8 @@
 // hand-rolled MF encoder "works on Intel but hangs on NVIDIA".
 //
 #include "encode/ColorConvert.h"
+#include "encode/Quality.h"   // h264LevelForResolution
 #include "gpu/GpuPipeline.h"
-#include "util/Win.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -23,21 +25,7 @@
 #include <thread>
 #include <vector>
 
-struct IMFTransform;
-struct IMFMediaEventGenerator;
-struct IMFDXGIDeviceManager;
-struct ICodecAPI;
-struct IMFSample;
-struct IMFMediaBuffer;
-struct ID3D11Texture2D;
-
 namespace soi {
-
-// Smallest H.264 level (as a level_idc, e.g. 40 == level 4.0) that can carry the
-// given resolution and frame rate. Used both to configure the encoder and to
-// build a truthful profile-level-id in the SDP -- understating the level makes
-// strict decoders reject the stream.
-int h264LevelForResolution(int width, int height, int fps);
 
 struct EncoderConfig {
     int  width       = 1920;
@@ -58,6 +46,23 @@ struct EncoderConfig {
     int  quality = 80;
     bool preferQualityRateControl = true;
 };
+
+} // namespace soi
+
+#if !defined(_WIN32)
+#include "encode/H264EncoderMac.h"
+#else
+#include "util/Win.h"
+
+struct IMFTransform;
+struct IMFMediaEventGenerator;
+struct IMFDXGIDeviceManager;
+struct ICodecAPI;
+struct IMFSample;
+struct IMFMediaBuffer;
+struct ID3D11Texture2D;
+
+namespace soi {
 
 class H264Encoder {
 public:
@@ -177,3 +182,5 @@ private:
 };
 
 } // namespace soi
+
+#endif // _WIN32

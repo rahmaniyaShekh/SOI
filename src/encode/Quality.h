@@ -95,4 +95,10 @@ int h264LevelFromSdp(const std::string& sdp);
 // `maxMacroblocks`. A no-op when it already fits or the limit is unknown.
 void clampToMacroblocks(int maxMacroblocks, int& width, int& height);
 
+// Smallest H.264 level (as a level_idc, e.g. 40 == level 4.0) that can carry the
+// given resolution and frame rate. Used both to configure the encoder and to
+// build a truthful profile-level-id in the SDP -- understating the level makes
+// strict decoders reject the stream.
+int h264LevelForResolution(int width, int height, int fps);
+
 } // namespace soi

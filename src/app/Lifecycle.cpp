@@ -4,10 +4,25 @@
 #include "app/Service.h"
 #include "app/Update.h"
 #include "util/Log.h"
-#include "util/Win.h"
+#include "util/Platform.h"
 
-#include <windows.h>
-#include <shlobj.h>
+#if defined(_WIN32)
+  #include "util/Win.h"
+  #include <windows.h>
+  #include <shlobj.h>
+#else
+  #include <miniz.h>
+  #include <fcntl.h>
+  #include <poll.h>
+  #include <signal.h>
+  #include <spawn.h>
+  #include <sys/stat.h>
+  #include <sys/wait.h>
+  #include <unistd.h>
+  #include <cerrno>
+  #include <cstring>
+extern char** environ;
+#endif
 
 #include <chrono>
 #include <cstdio>
@@ -25,34 +40,20 @@ namespace {
 
 using namespace std::chrono_literals;
 
-constexpr char kExeAsset[]  = "soi-share.exe";
+#if defined(_WIN32)
+// The release asset `update` downloads, and what it is called once installed.
+constexpr char kExeAsset[]   = "soi-share.exe";
+constexpr char kStagedName[] = "soi-share.download.exe";
+constexpr char kUserKind[]   = "Windows user";
+#else
+// A zip rather than the bare binary: a browser download of a bare file loses
+// its executable bit, and the zip is also what people download by hand.
+constexpr char kExeAsset[]   = "soi-share-macos.zip";
+constexpr char kBinaryName[] = "soi-share";
+constexpr char kStagedName[] = "soi-share.download";
+constexpr char kUserKind[]   = "macOS user, in the login Keychain";
+#endif
 constexpr char kSumsAsset[] = "SHA256SUMS.txt";
-
-std::string directoryOf(const std::string& path) {
-    const size_t slash = path.find_last_of("\\/");
-    return slash == std::string::npos ? std::string(".") : path.substr(0, slash);
-}
-
-bool fileExists(const std::string& path) {
-    const DWORD a = GetFileAttributesW(toUtf16(path).c_str());
-    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
-}
-
-bool dirExists(const std::string& path) {
-    const DWORD a = GetFileAttributesW(toUtf16(path).c_str());
-    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
-}
-
-bool writeFileBytes(const std::string& path, const std::string& bytes) {
-    HANDLE f = CreateFileW(toUtf16(path).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return false;
-    DWORD written = 0;
-    const BOOL ok = bytes.empty() ||
-                    WriteFile(f, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
-    CloseHandle(f);
-    return ok && written == bytes.size();
-}
 
 bool waitUntilGone(unsigned long pid, const std::string& exe, std::chrono::milliseconds limit) {
     const auto deadline = std::chrono::steady_clock::now() + limit;
@@ -63,6 +64,7 @@ bool waitUntilGone(unsigned long pid, const std::string& exe, std::chrono::milli
     return !processAlive(pid, exe);
 }
 
+#if defined(_WIN32)
 bool terminatePid(unsigned long pid) {
     HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
     if (!h) return false;
@@ -114,33 +116,123 @@ int runChild(const std::string& exe, const std::string& args, std::string* captu
     CloseHandle(pi.hProcess);
     return static_cast<int>(code);
 }
+#else
+bool terminatePid(unsigned long pid) {
+    if (kill(static_cast<pid_t>(pid), SIGKILL) != 0) return false;
+    for (int i = 0; i < 50 && processAlive(pid); ++i)
+        std::this_thread::sleep_for(100ms);
+    return true;
+}
+
+// Runs `exe` with `args` -- already quoted for a POSIX shell, as quoteArgument
+// produces them -- in this terminal and waits. Returns its exit code, or -1 if
+// it could not be started or timed out. With `capture`, stdout and stderr are
+// collected instead of shown.
+int runChild(const std::string& exe, const std::string& args, std::string* capture,
+             int timeoutMs = -1) {
+    const std::string command = "exec " + quoteArgument(exe) + (args.empty() ? "" : " " + args);
+    const char* const argv[] = {"/bin/sh", "-c", command.c_str(), nullptr};
+
+    int fds[2] = {-1, -1};
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    if (capture) {
+        if (pipe(fds) != 0) { posix_spawn_file_actions_destroy(&actions); return -1; }
+        posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
+        posix_spawn_file_actions_adddup2(&actions, fds[1], STDERR_FILENO);
+        posix_spawn_file_actions_addclose(&actions, fds[0]);
+        posix_spawn_file_actions_addclose(&actions, fds[1]);
+    }
+    pid_t pid = 0;
+    const int rc = posix_spawn(&pid, "/bin/sh", &actions, nullptr,
+                               const_cast<char* const*>(argv), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (capture) close(fds[1]);
+    if (rc != 0) {
+        if (capture) close(fds[0]);
+        return -1;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    bool timedOut = false;
+    if (capture) {
+        char buf[4096];
+        for (;;) {
+            int wait = -1;
+            if (timeoutMs >= 0) {
+                const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now()).count();
+                if (left <= 0) { timedOut = true; break; }
+                wait = static_cast<int>(left);
+            }
+            pollfd p{fds[0], POLLIN, 0};
+            const int ready = poll(&p, 1, wait);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready == 0) { timedOut = true; break; }
+            const ssize_t n = read(fds[0], buf, sizeof buf);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            capture->append(buf, static_cast<size_t>(n));
+        }
+        close(fds[0]);
+    }
+
+    int status = 0;
+    for (;;) {
+        const pid_t done = waitpid(pid, &status, timedOut ? WNOHANG : (timeoutMs < 0 ? 0 : WNOHANG));
+        if (done == pid) break;
+        if (done < 0 && errno != EINTR) return -1;
+        if (timedOut || (timeoutMs >= 0 && std::chrono::steady_clock::now() >= deadline)) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            return -1;
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+// Pulls the soi-share binary out of the release zip. The archive is the same
+// one people download by hand: a folder holding the binary and its notices.
+bool extractBinaryFromZip(const std::string& zip, std::string& binary, std::string& error) {
+    binary.clear();
+    mz_zip_archive archive{};
+    if (!mz_zip_reader_init_mem(&archive, zip.data(), zip.size(), 0)) {
+        error = "the download is not a readable zip archive";
+        return false;
+    }
+    bool found = false;
+    const mz_uint count = mz_zip_reader_get_num_files(&archive);
+    for (mz_uint i = 0; i < count && !found; ++i) {
+        mz_zip_archive_file_stat st{};
+        if (!mz_zip_reader_file_stat(&archive, i, &st) || st.m_is_directory) continue;
+        std::string name = st.m_filename;
+        const size_t slash = name.find_last_of('/');
+        if (slash != std::string::npos) name = name.substr(slash + 1);
+        if (name != kBinaryName) continue;
+        size_t size = 0;
+        void* data = mz_zip_reader_extract_to_heap(&archive, i, &size, 0);
+        if (!data) { error = "could not decompress the binary from the zip"; break; }
+        binary.assign(static_cast<const char*>(data), size);
+        mz_free(data);
+        found = true;
+    }
+    mz_zip_reader_end(&archive);
+    if (!found && error.empty()) error = "the zip does not contain a soi-share binary";
+    return found && !binary.empty();
+}
+
+bool makeDirectories(const std::string& dir) {
+    if (dir.empty() || dirExists(dir)) return true;
+    makeDirectories(directoryOf(dir));
+    return mkdir(dir.c_str(), 0755) == 0 || dirExists(dir);
+}
+#endif
 
 std::string trimmed(std::string s) {
     while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
     while (!s.empty() && (s.front() == '\n' || s.front() == '\r' || s.front() == ' ')) s.erase(0, 1);
     return s;
-}
-
-// Makes sure the install folder is on the user PATH exactly once.
-bool ensureOnUserPath(const std::string& dir, std::string& report) {
-    std::string value, error;
-    bool exists = false;
-    if (!readUserPath(value, exists, error)) { report = error; return false; }
-
-    const int present = pathListCount(value, dir);
-    if (present == 1) { report = "already on your PATH"; return true; }
-
-    std::string next = value;
-    if (present > 1) {   // tidy duplicates an older installer left behind
-        int removed = 0;
-        next = pathListRemove(next, dir, removed);
-    }
-    bool changed = false;
-    next = pathListAdd(next, dir, changed);
-    if (!writeUserPath(next, error)) { report = error; return false; }
-    broadcastEnvironmentChange();
-    report = present > 1 ? "on your PATH (removed duplicate entries)" : "added to your PATH";
-    return true;
 }
 
 void printTokenHelp() {
@@ -152,7 +244,11 @@ void printTokenHelp() {
         "    3. Permissions -> Repository permissions -> Contents: Read-only.\n"
         "    4. Generate, copy the github_pat_... value, and run `soi-share update`\n"
         "       again; paste it when asked (it is not shown as you type).\n"
+#if defined(_WIN32)
         "  Or set it for one terminal:  $env:SOI_SHARE_GITHUB_TOKEN = '<token>'\n"
+#else
+        "  Or set it for one terminal:  export SOI_SHARE_GITHUB_TOKEN='<token>'\n"
+#endif
         "  Details: SETUP.md, \"Private repository: the access token\".\n",
         githubRepo(), githubRepo());
 }
@@ -164,6 +260,7 @@ void printTokenHelp() {
 const char* appVersion() { return SOI_VERSION; }
 const char* githubRepo() { return SOI_GITHUB_REPO; }
 
+#if defined(_WIN32)
 bool loadEmbeddedResource(int id, std::string& out) {
     out.clear();
     HRSRC res = FindResourceW(nullptr, MAKEINTRESOURCEW(id), RT_RCDATA);
@@ -174,6 +271,9 @@ bool loadEmbeddedResource(int id, std::string& out) {
     out.assign(static_cast<const char*>(data), SizeofResource(nullptr, res));
     return !out.empty();
 }
+#endif
+// Elsewhere loadEmbeddedResource() is generated at build time from the same
+// files (cmake/EmbedResources.cmake), since there is no resource section.
 
 int cmdVersion(bool shortForm) {
     if (shortForm) { std::printf("%s\n", appVersion()); return 0; }
@@ -287,6 +387,7 @@ int cmdInstall(bool quiet) {
     const std::string dir    = installDir();
     const std::string target = installedExePath();
 
+#if defined(_WIN32)
     if (dir.rfind("\\Programs\\soi-share") == std::string::npos || dir.size() < 24) {
         std::printf("cannot work out where %%LOCALAPPDATA%% is, so there is nowhere to install to\n");
         return 1;
@@ -298,6 +399,18 @@ int cmdInstall(bool quiet) {
         std::printf("could not create %s\n", dir.c_str());
         return 1;
     }
+#else
+    if (dir.rfind("/.soi-share/bin") == std::string::npos || dir.size() < 17) {
+        std::printf("cannot work out where your home folder is, so there is nowhere to install to\n");
+        return 1;
+    }
+    std::printf("Installing soi-share %s for this macOS user (no admin needed)\n", appVersion());
+
+    if (!makeDirectories(dir)) {
+        std::printf("could not create %s\n", dir.c_str());
+        return 1;
+    }
+#endif
 
     StopOutcome stopped;
     if (samePath(self, target)) {
@@ -323,15 +436,15 @@ int cmdInstall(bool quiet) {
     }
 
     // Copied from a download, the file carries the internet zone mark and
-    // SmartScreen would stop it again on the next double-click.
+    // SmartScreen / Gatekeeper would stop it again on the next run.
     removeZoneIdentifier(target);
 
     // The binary redistributes third-party code; its notices go with it.
     if (std::string notices; loadEmbeddedResource(kNoticesResourceId, notices))
-        writeFileBytes(dir + "\\THIRD_PARTY_NOTICES.md", notices);
+        writeFileBytes(joinPath(dir, "THIRD_PARTY_NOTICES.md"), notices);
 
     std::string pathReport;
-    if (!ensureOnUserPath(dir, pathReport)) {
+    if (!addToUserPath(dir, pathReport)) {
         std::printf("  PATH      could not update: %s\n"
                     "            You can still run it by its full path.\n", pathReport.c_str());
     } else {
@@ -345,7 +458,7 @@ int cmdInstall(bool quiet) {
     const TokenChoice token = tokenFromEnvironmentOrStore();
     if (token.source == "SOI_SHARE_GITHUB_TOKEN") {
         if (token.saveable && saveToken(token.token))
-            std::printf("  token     saved for `soi-share update` (encrypted for this Windows user)\n");
+            std::printf("  token     saved for `soi-share update` (encrypted for this %s)\n", kUserKind);
         else if (!token.saveable)
             std::printf("  token     NOT saved: it is a %s, which can reach every repository\n"
                         "            your account can. `soi-share update` will ask for a\n"
@@ -362,14 +475,18 @@ int cmdInstall(bool quiet) {
     if (!quiet) {
         // This process inherited its PATH from the shell; a fresh terminal is
         // the only way that shell sees the change.
-        std::string current(32768, '\0');
-        const DWORD n = GetEnvironmentVariableA("PATH", current.data(), static_cast<DWORD>(current.size()));
-        current.resize(n < current.size() ? n : 0);
+        const std::string current = envVar("PATH");
         if (pathListContains(current, dir))
             std::printf("\nDone. Run:  soi-share start\n");
         else
+#if defined(_WIN32)
             std::printf("\nDone. Open a NEW terminal (this one still has the old PATH), then run:\n"
                         "    soi-share start\n");
+#else
+            std::printf("\nDone. Open a NEW terminal window (this one still has the old PATH),\n"
+                        "or run this here:  export PATH=\"$PATH:%s\"\n"
+                        "Then:  soi-share start\n", dir.c_str());
+#endif
     }
     return 0;
 }
@@ -380,26 +497,23 @@ int cmdUninstall(bool purge) {
 
     const StopOutcome stopped = stopRunningInstance(true, false);
     if (stopped.wasRunning)
+#if defined(_WIN32)
         std::printf(stopped.stopped ? "  share     stopped\n"
                                     : "  share     could NOT be stopped; end soi-share.exe in "
                                       "Task Manager and run uninstall again\n");
+#else
+        std::printf(stopped.stopped ? "  share     stopped\n"
+                                    : "  share     could NOT be stopped; quit soi-share in "
+                                      "Activity Monitor and run uninstall again\n");
+#endif
     if (stopped.wasRunning && !stopped.stopped) return 1;
 
-    std::string value, error;
-    bool exists = false;
-    if (readUserPath(value, exists, error)) {
-        int removed = 0;
-        const std::string next = pathListRemove(value, dir, removed);
-        if (removed && writeUserPath(next, error)) {
-            broadcastEnvironmentChange();
-            std::printf("  PATH      removed %s\n", dir.c_str());
-        } else if (removed) {
-            std::printf("  PATH      could not update: %s\n", error.c_str());
-        } else {
-            std::printf("  PATH      nothing to remove\n");
-        }
-    } else {
-        std::printf("  PATH      could not read: %s\n", error.c_str());
+    std::string error;
+    {
+        bool removed = false;
+        std::string report;
+        removeFromUserPath(dir, removed, report);
+        std::printf("  PATH      %s\n", report.c_str());
     }
 
     if (!dirExists(dir)) {
@@ -414,6 +528,9 @@ int cmdUninstall(bool purge) {
         }
         std::printf("  program   %s is removed a few seconds after this exits\n", dir.c_str());
     } else if (removeDirectoryTree(dir)) {
+#if !defined(_WIN32)
+        rmdir(directoryOf(dir).c_str());   // ~/.soi-share, if nothing else is in it
+#endif
         std::printf("  program   removed %s\n", dir.c_str());
     } else {
         std::printf("  program   could not remove everything in %s (is a file open?)\n", dir.c_str());
@@ -515,8 +632,8 @@ int cmdUpdate(bool checkOnly, bool force, bool forgetToken) {
             std::string saved;
             if (!loadSavedToken(saved) || saved != token.token) {
                 if (saveToken(token.token))
-                    std::printf("Saved your token for next time (encrypted for this Windows user; "
-                                "`soi-share update --forget-token` deletes it).\n");
+                    std::printf("Saved your token for next time (encrypted for this %s; "
+                                "`soi-share update --forget-token` deletes it).\n", kUserKind);
             }
         } else {
             std::printf("Not saving this %s: it can reach every repository your account can.\n"
@@ -582,6 +699,19 @@ int cmdUpdate(bool checkOnly, bool force, bool forgetToken) {
     }
     std::printf("  sha256 verified  %s\n", actual.c_str());
 
+#if !defined(_WIN32)
+    // The checksum covers the zip, so what comes out of it is covered too.
+    {
+        std::string binary, zipError;
+        if (!extractBinaryFromZip(exeBytes, binary, zipError)) {
+            std::printf("could not unpack %s: %s; nothing was changed.\n", kExeAsset,
+                        zipError.c_str());
+            return 1;
+        }
+        exeBytes = std::move(binary);
+    }
+#endif
+
     // Update the installed copy; a portable copy that was never installed
     // updates itself in place.
     const std::string target = fileExists(installedExePath()) ? installedExePath() : currentExePath();
@@ -589,15 +719,18 @@ int cmdUpdate(bool checkOnly, bool force, bool forgetToken) {
     // Staged beside the target (same volume, so the final move is a rename),
     // and run once to prove it is a working soi-share of the promised version
     // before anything is replaced.
-    const std::string staged = directoryOf(target) + "\\soi-share.download.exe";
+    const std::string staged = joinPath(directoryOf(target), kStagedName);
     if (!writeFileBytes(staged, exeBytes)) {
         std::printf("could not write %s\n", staged.c_str());
         return 1;
     }
+#if !defined(_WIN32)
+    chmod(staged.c_str(), 0755);
+#endif
     std::string reported;
     const int probe = runChild(staged, "version --short", &reported, 15000);
     if (probe != 0 || trimmed(reported) != versionString(latest)) {
-        DeleteFileW(toUtf16(staged).c_str());
+        removeFile(staged);
         std::printf("the downloaded exe did not run correctly (exit %d, reported '%s'); "
                     "nothing was changed.\n", probe, trimmed(reported).c_str());
         return 1;
@@ -605,7 +738,7 @@ int cmdUpdate(bool checkOnly, bool force, bool forgetToken) {
 
     const StopOutcome stopped = stopRunningInstance(true, true);
     if (!stopped.stopped) {
-        DeleteFileW(toUtf16(staged).c_str());
+        removeFile(staged);
         std::printf("could not stop the running share; run `soi-share stop --force` and "
                     "`soi-share update` again.\n");
         return 1;
@@ -613,7 +746,7 @@ int cmdUpdate(bool checkOnly, bool force, bool forgetToken) {
 
     std::string error;
     const bool replaced = replaceExecutable(target, staged, error);
-    DeleteFileW(toUtf16(staged).c_str());
+    removeFile(staged);
     if (!replaced) {
         std::printf("could not replace %s: %s\n", target.c_str(), error.c_str());
         return 1;
